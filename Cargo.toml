@@ -1,0 +1,47 @@
+[package]
+name = "snm-brightdata-client"
+version = "0.1.0"
+edition = "2021"
+description = "Bright Data MCP Client implemented in Rust with Actix Web"
+authors = ["Inx Maurya <you@example.com>"]
+license = "MIT"
+repository = "https://github.com/snmmaurya/snm-brightdata-client"
+readme = "README.md"
+keywords = ["mcp", "brightdata", "proxy", "client", "actix"]
+categories = ["web-programming", "api-bindings"]
+
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+actix-web = "4.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+env_logger = "0.10"
+log = "0.4"
+futures = "0.3"
+thiserror = "1.0"
+anyhow = "1.0"
+base64 = "0.21"
+dotenv = "0.15"
+urlencoding = "2.1"
+async-trait = "0.1.88"
+clap = { version = "4.5", features = ["derive"] }
+
+
+[lib]
+name = "snm_brightdata_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "snm_server"
+path = "src/bin/snm_server.rs"
+
+[[bin]]
+name = "snm_cli"
+path = "src/bin/snm_cli.rs"
