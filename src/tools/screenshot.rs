@@ -1,22 +1,23 @@
-// ===== src/tools/extract.rs - CORRECTED VERSION =====
+
+
+// ===== src/tools/screenshot.rs - CORRECTED VERSION =====
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use async_trait::async_trait;
+use serde_json::{Value, json};
 use reqwest::Client;
-use serde_json::{json, Value};
-use std::env;
 use std::time::Duration;
 
-pub struct Extractor;
+pub struct ScreenshotTool;
 
 #[async_trait]
-impl Tool for Extractor {
+impl Tool for ScreenshotTool {
     fn name(&self) -> &str {
-        "extract_data"
+        "take_screenshot"
     }
 
     fn description(&self) -> &str {
-        "Extract data from a webpage using BrightData"
+        "Take a screenshot of a webpage using BrightData"
     }
 
     fn input_schema(&self) -> Value {
@@ -25,7 +26,7 @@ impl Tool for Extractor {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to extract data from"
+                    "description": "The URL to screenshot"
                 }
             },
             "required": ["url"]
@@ -38,41 +39,39 @@ impl Tool for Extractor {
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'url' parameter".into()))?;
 
-        let result = self.extract_with_brightdata(url).await?;
+        let result = self.screenshot_with_brightdata(url).await?;
 
-        let content_text = result.get("content").and_then(|c| c.as_str()).unwrap_or("No data");
         let mcp_content = vec![McpContent::text(format!(
-            "📊 **Data extracted from {}**\n\n{}",
-            url,
-            content_text
+            "📸 Screenshot captured from: {}\n\nNote: Screenshot data available in raw response",
+            url
         ))];
 
         Ok(ToolResult::success_with_raw(mcp_content, result))
     }
 }
 
-impl Extractor {
-    async fn extract_with_brightdata(&self, url: &str) -> Result<Value, BrightDataError> {
-        let api_token = env::var("BRIGHTDATA_API_TOKEN")
-            .or_else(|_| env::var("API_TOKEN"))
+impl ScreenshotTool {
+    async fn screenshot_with_brightdata(&self, url: &str) -> Result<Value, BrightDataError> {
+        let api_token = std::env::var("BRIGHTDATA_API_TOKEN")
+            .or_else(|_| std::env::var("API_TOKEN"))
             .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
 
-        let base_url = env::var("BRIGHTDATA_BASE_URL")
+        let base_url = std::env::var("BRIGHTDATA_BASE_URL")
             .unwrap_or_else(|_| "https://api.brightdata.com".to_string());
 
-        let zone = env::var("WEB_UNLOCKER_ZONE")
+        let zone = std::env::var("WEB_UNLOCKER_ZONE")
             .unwrap_or_else(|_| "default".to_string());
 
-        // Valid BrightData parameters only
+        // Valid BrightData parameters for screenshots
         let payload = json!({
             "url": url,
             "zone": zone,
             "format": "raw",
-            "data_format": "markdown"
+            "data_format": "screenshot"  // This is valid according to docs
         });
 
         let client = Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(180))
             .build()
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
@@ -83,13 +82,13 @@ impl Extractor {
             .json(&payload)
             .send()
             .await
-            .map_err(|e| BrightDataError::ToolError(format!("Extraction request failed: {}", e)))?;
+            .map_err(|e| BrightDataError::ToolError(format!("Screenshot request failed: {}", e)))?;
 
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(BrightDataError::ToolError(format!(
-                "BrightData extraction error {}: {}",
+                "BrightData screenshot error {}: {}",
                 status, error_text
             )));
         }
@@ -98,7 +97,7 @@ impl Extractor {
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
         Ok(json!({
-            "content": content,
+            "screenshot_data": content,
             "url": url,
             "success": true
         }))

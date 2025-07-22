@@ -3,7 +3,7 @@ use crate::{config::BrightDataConfig, error::BrightDataError};
 use reqwest::Client;
 use serde_json::Value;
 use anyhow::{Result, anyhow};
-use crate::tool::{Tool, ToolResolver};
+use crate::tool::ToolResolver;
 
 pub struct BrightDataClient {
     config: BrightDataConfig,
@@ -41,6 +41,8 @@ impl BrightDataClient {
         let tool = resolver
             .resolve(tool_name)
             .ok_or_else(|| anyhow!("Tool `{tool_name}` not found"))?;
-        tool.execute(input).await.map_err(|e| anyhow!(e))
+        
+        // Use legacy method for backward compatibility
+        tool.execute_legacy(input).await.map_err(|e| anyhow!(e))
     }
 }

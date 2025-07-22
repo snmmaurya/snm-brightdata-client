@@ -1803,13 +1803,14 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "snm-brightdata-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "actix-web",
  "actix-web-lab",
  "anyhow",
  "async-trait",
  "base64 0.21.7",
+ "bytes",
  "chrono",
  "clap",
  "dotenv",
@@ -1817,6 +1818,7 @@ dependencies = [
  "futures",
  "futures-util",
  "log",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

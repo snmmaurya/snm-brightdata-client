@@ -14,6 +14,13 @@ use snm_brightdata_client::server::{
     health_check,
     cors_handler,
 };
+use snm_brightdata_client::tool::ToolResolver;
+use snm_brightdata_client::tools::{
+    scrape::ScrapeMarkdown,
+    search::SearchEngine,
+    extract::Extractor,
+    screenshot::ScreenshotTool,
+};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,7 +35,7 @@ struct InvokeRequest {
 async fn sse_tool(
     req: HttpRequest,
     req_body: web::Json<InvokeRequest>,
-    state: web::Data<AppState>
+    _state: web::Data<AppState> // Made optional since we're using direct tool execution
 ) -> Sse<ReceiverStream<Result<Event, Infallible>>> {
     let expected_token = std::env::var("MCP_AUTH_TOKEN").unwrap_or_default();
     let auth_header = req
@@ -39,6 +46,7 @@ async fn sse_tool(
 
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
 
+    // 🔒 Auth check
     if !auth_header.starts_with("Bearer ") || !auth_header.ends_with(&expected_token) {
         let _ = tx.send(Ok(Event::Data(Data::new("Unauthorized")))).await;
         return Sse::from_stream(ReceiverStream::new(rx));
@@ -46,25 +54,152 @@ async fn sse_tool(
 
     let tool_name = req_body.tool.clone();
     let parameters = req_body.parameters.clone();
-    let cloned_state = state.clone();
 
+    // 🔄 Spawn tool execution in background with enhanced MCP support
     tokio::spawn(async move {
-        let result = match tool_name.as_str() {
-            "scrape_website" => snm_brightdata_client::server::handle_scrape_website(&parameters, &cloned_state).await,
-            "search_web" => snm_brightdata_client::server::handle_search_web(&parameters, &cloned_state).await,
-            "extract_data" => snm_brightdata_client::server::handle_extract_placeholder(&parameters).await,
-            _ => Err("Tool not found".to_string()),
+        let start_time = chrono::Utc::now();
+        let _ = tx.send(Ok(Event::Comment(format!("Tool '{}' execution started at {}", tool_name, start_time).into()))).await;
+
+        // Use ToolResolver for consistent tool execution
+        let resolver = ToolResolver::default();
+        let result = match resolver.resolve(&tool_name) {
+            Some(tool) => {
+                // Send progress update
+                let _ = tx.send(Ok(Event::Data(Data::new(format!("[progress] Executing {} tool...", tool_name))))).await;
+                
+                // Execute tool with MCP-compatible response
+                match tool.execute(parameters).await {
+                    Ok(tool_result) => {
+                        // Send MCP-compatible content
+                        for (i, content) in tool_result.content.iter().enumerate() {
+                            let event_data = match content.content_type.as_str() {
+                                "text" => {
+                                    if tool_result.content.len() > 1 {
+                                        format!("[content-{}] {}", i + 1, content.text)
+                                    } else {
+                                        content.text.clone()
+                                    }
+                                },
+                                "image" => {
+                                    format!("[image] {}\nImage data available (length: {} chars)", 
+                                           content.text,
+                                           content.data.as_ref().map(|d| d.len()).unwrap_or(0))
+                                },
+                                _ => {
+                                    format!("[{}] {}", content.content_type, content.text)
+                                }
+                            };
+                            let _ = tx.send(Ok(Event::Data(Data::new(event_data)))).await;
+                        }
+                        Ok(())
+                    },
+                    Err(e) => Err(format!("Tool execution error: {}", e))
+                }
+            },
+            None => Err(format!("Tool '{}' not found", tool_name))
         };
 
-        let message = match result {
-            Ok(content) => Event::Data(Data::new(content)),
-            Err(e) => Event::Data(Data::new(format!("Error: {}", e))),
+        // Send final result
+        let final_message = match result {
+            Ok(_) => Event::Data(Data::new(format!("[completed] Tool '{}' executed successfully", tool_name))),
+            Err(e) => Event::Data(Data::new(format!("[error] {}", e))),
         };
 
-        let _ = tx.send(Ok(message)).await;
+        let end_time = chrono::Utc::now();
+        let _ = tx.send(Ok(final_message)).await;
+        let _ = tx.send(Ok(Event::Comment(format!("Tool '{}' finished at {} (duration: {}ms)", 
+                                                tool_name, 
+                                                end_time, 
+                                                (end_time - start_time).num_milliseconds()).into()))).await;
     });
 
     Sse::from_stream(ReceiverStream::new(rx))
+}
+
+// Enhanced direct tool invocation endpoint
+#[post("/invoke")]
+async fn invoke_tool(
+    req: HttpRequest,
+    req_body: web::Json<InvokeRequest>,
+) -> Result<actix_web::HttpResponse, actix_web::Error> {
+    let expected_token = std::env::var("MCP_AUTH_TOKEN").unwrap_or_default();
+    let auth_header = req
+        .headers()
+        .get("Authorization")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    if !auth_header.starts_with("Bearer ") || !auth_header.ends_with(&expected_token) {
+        return Ok(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": "Unauthorized",
+            "message": "Invalid or missing authorization token"
+        })));
+    }
+
+    let tool_name = &req_body.tool;
+    let parameters = req_body.parameters.clone();
+
+    // Use ToolResolver for consistent tool execution
+    let resolver = ToolResolver::default();
+    match resolver.resolve(tool_name) {
+        Some(tool) => {
+            match tool.execute(parameters).await {
+                Ok(tool_result) => {
+                    // Return MCP-compatible response
+                    Ok(actix_web::HttpResponse::Ok().json(serde_json::json!({
+                        "success": true,
+                        "tool": tool_name,
+                        "content": tool_result.content,
+                        "is_error": tool_result.is_error.unwrap_or(false),
+                        "raw_data": tool_result.raw_value
+                    })))
+                },
+                Err(e) => {
+                    Ok(actix_web::HttpResponse::InternalServerError().json(serde_json::json!({
+                        "success": false,
+                        "tool": tool_name,
+                        "error": format!("Tool execution failed: {}", e)
+                    })))
+                }
+            }
+        },
+        None => {
+            Ok(actix_web::HttpResponse::NotFound().json(serde_json::json!({
+                "success": false,
+                "tool": tool_name,
+                "error": format!("Tool '{}' not found", tool_name)
+            })))
+        }
+    }
+}
+
+// Enhanced tools list endpoint
+#[actix_web::get("/tools")]
+async fn list_tools() -> Result<actix_web::HttpResponse, actix_web::Error> {
+    let resolver = ToolResolver::default();
+    let tools = resolver.list_tools();
+    
+    Ok(actix_web::HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "tools": tools,
+        "count": tools.len()
+    })))
+}
+
+// Enhanced health check endpoint
+#[actix_web::get("/health")]
+async fn enhanced_health_check(
+    state: web::Data<AppState>
+) -> Result<actix_web::HttpResponse, actix_web::Error> {
+    Ok(actix_web::HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "service": "snm-brightdata-mcp-server",
+        "session_id": state.session_id,
+        "uptime_seconds": (chrono::Utc::now() - state.start_time).num_seconds(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "available_tools": ["scrape_website", "search_web", "extract_data", "take_screenshot"],
+        "mcp_compatible": true
+    })))
 }
 
 #[actix_web::main]
@@ -77,7 +212,14 @@ async fn main() -> std::io::Result<()> {
     let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let bind_address = format!("0.0.0.0:{}", port);
 
-    println!("🚀 BrightData MCP HTTP Server running on http://{}", bind_address);
+    println!("🚀 Enhanced BrightData MCP HTTP Server running on http://{}", bind_address);
+    println!("📋 Available endpoints:");
+    println!("  • POST /mcp          - MCP JSON-RPC protocol");
+    println!("  • POST /sse          - Server-Sent Events tool execution");
+    println!("  • POST /invoke       - Direct tool invocation");
+    println!("  • GET  /tools        - List available tools");
+    println!("  • GET  /health       - Health check");
+    println!("📚 Available tools: scrape_website, search_web, extract_data, take_screenshot");
 
     HttpServer::new(move || {
         App::new()
@@ -85,6 +227,9 @@ async fn main() -> std::io::Result<()> {
             .wrap(Logger::default())
             .route("/mcp", web::post().to(handle_mcp_request))
             .route("/health", web::get().to(health_check))
+            .service(enhanced_health_check)
+            .service(list_tools)
+            .service(invoke_tool)
             .service(sse_tool)
             .default_service(web::to(cors_handler))
     })

@@ -1,6 +1,6 @@
 [package]
 name = "snm-brightdata-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Bright Data MCP Client implemented in Rust with Actix Web"
 authors = ["Inx Maurya <you@example.com>"]
@@ -9,7 +9,6 @@ repository = "https://github.com/snmmaurya/snm-brightdata-client"
 readme = "README.md"
 keywords = ["mcp", "brightdata", "proxy", "client", "actix"]
 categories = ["web-programming", "api-bindings"]
-
 
 [badges]
 maintenance = { status = "actively-developed" }
@@ -35,8 +34,8 @@ clap = { version = "4.5", features = ["derive"] }
 futures-util = "0.3.31"
 actix-web-lab = "0.24.2"
 tokio-stream = "0.1.17"
-
-
+bytes = "1.0" 
+regex = "1.0"
 
 [lib]
 name = "snm_brightdata_client"

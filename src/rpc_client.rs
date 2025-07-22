@@ -13,17 +13,22 @@ impl RpcClient {
         match tool_name {
             "scrape_website" => {
                 crate::tools::scrape::ScrapeMarkdown
-                    .execute(parameters)
+                    .execute_legacy(parameters)
                     .await
             }
             "search_web" => {
                 crate::tools::search::SearchEngine
-                    .execute(parameters)
+                    .execute_legacy(parameters)
                     .await
             }
             "extract_data" => {
                 crate::tools::extract::Extractor
-                    .execute(parameters)
+                    .execute_legacy(parameters)
+                    .await
+            }
+            "take_screenshot" => {
+                crate::tools::screenshot::ScreenshotTool
+                    .execute_legacy(parameters)
                     .await
             }
             _ => Err(BrightDataError::ToolError(format!(
