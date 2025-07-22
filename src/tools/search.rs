@@ -37,11 +37,15 @@ impl Tool for SearchEngine {
 
         let api_token = std::env::var("BRIGHTDATA_API_TOKEN")
             .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
+        let base_url = std::env::var("BRIGHTDATA_BASE_URL")
+            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_BASE_URL".into()))?;
+
+        let url = format!("{}/request", base_url);
 
         let client = Client::new();
 
         let response = client
-            .post("https://api.brightdata.com/request")
+            .post(&url)
             .header("Authorization", format!("Bearer {}", api_token))
             .json(&body)
             .send()

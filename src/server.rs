@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use uuid::Uuid;
+use crate::error::BrightDataError;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -27,7 +28,7 @@ impl Config {
             web_unlocker_zone: env::var("WEB_UNLOCKER_ZONE").unwrap_or_else(|_| "default_zone".to_string()),
             browser_zone: env::var("BROWSER_ZONE").unwrap_or_else(|_| "default_browser".to_string()),
             rate_limit: env::var("RATE_LIMIT").ok(),
-            timeout: Duration::from_secs(env::var("REQUEST_TIMEOUT").unwrap_or_else(|_| "60".to_string()).parse().unwrap_or(60)),
+            timeout: Duration::from_secs(env::var("REQUEST_TIMEOUT").unwrap_or_else(|_| "300".to_string()).parse().unwrap_or(300)),
             max_retries: env::var("MAX_RETRIES").unwrap_or_else(|_| "3".to_string()).parse().unwrap_or(3),
         })
     }
@@ -80,7 +81,11 @@ pub struct McpError {
 pub struct BrightDataUrls;
 
 impl BrightDataUrls {
-    pub const REQUEST_API: &'static str = "https://api.brightdata.com/request";
+    pub fn request_api() -> String {
+        let base_url = std::env::var("BRIGHTDATA_BASE_URL")
+            .unwrap_or_else(|_| "https://api.brightdata.com".to_string());
+        format!("{}/request", base_url)
+    }
 }
 
 pub async fn handle_mcp_request(
@@ -231,10 +236,7 @@ async fn check_rate_limit(tool: &str, state: &web::Data<AppState>) -> bool {
 
 
 
-
-
-
-async fn handle_scrape_website(args: &serde_json::Value, state: &web::Data<AppState>) -> Result<String, String> {
+pub async fn handle_scrape_website(args: &serde_json::Value, state: &web::Data<AppState>) -> Result<String, String> {
     let url = args.get("url").and_then(|v| v.as_str()).ok_or("Missing 'url'")?;
     let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("markdown");
 
@@ -248,8 +250,10 @@ async fn handle_scrape_website(args: &serde_json::Value, state: &web::Data<AppSt
         payload["data_format"] = serde_json::json!("markdown");
     }
 
+    let url = BrightDataUrls::request_api();
+
     let res = state.http_client
-        .post(BrightDataUrls::REQUEST_API)
+        .post(&url)
         .header("Authorization", format!("Bearer {}", state.config.api_token))
         .json(&payload)
         .send()
@@ -260,7 +264,7 @@ async fn handle_scrape_website(args: &serde_json::Value, state: &web::Data<AppSt
     Ok(body)
 }
 
-async fn handle_search_web(args: &serde_json::Value, state: &web::Data<AppState>) -> Result<String, String> {
+pub async fn handle_search_web(args: &serde_json::Value, state: &web::Data<AppState>) -> Result<String, String> {
     let query = args.get("query").and_then(|v| v.as_str()).ok_or("Missing 'query'")?;
     let engine = args.get("engine").and_then(|v| v.as_str()).unwrap_or("google");
     let cursor = args.get("cursor").and_then(|v| v.as_str()).unwrap_or("0");
@@ -274,8 +278,9 @@ async fn handle_search_web(args: &serde_json::Value, state: &web::Data<AppState>
         "data_format": "markdown"
     });
 
+    let url = BrightDataUrls::request_api();
     let res = state.http_client
-        .post(BrightDataUrls::REQUEST_API)
+        .post(&url)
         .header("Authorization", format!("Bearer {}", state.config.api_token))
         .json(&payload)
         .send()
@@ -286,7 +291,7 @@ async fn handle_search_web(args: &serde_json::Value, state: &web::Data<AppState>
     Ok(body)
 }
 
-async fn handle_extract_placeholder(_args: &serde_json::Value) -> Result<String, String> {
+pub async fn handle_extract_placeholder(_args: &serde_json::Value) -> Result<String, String> {
     Ok("🧠 Extract tool placeholder: AI-based structured data extraction coming soon.".to_string())
 }
 
