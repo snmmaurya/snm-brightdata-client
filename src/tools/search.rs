@@ -1,4 +1,4 @@
-// ===== src/tools/search.rs - CORRECTED VERSION =====
+// src/tools/search.rs
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use async_trait::async_trait;

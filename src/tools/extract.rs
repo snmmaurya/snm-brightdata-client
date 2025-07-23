@@ -1,4 +1,4 @@
-// ===== src/tools/extract.rs - CORRECTED VERSION =====
+// src/tools/extract.rs
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use async_trait::async_trait;

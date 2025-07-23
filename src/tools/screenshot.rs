@@ -1,6 +1,4 @@
-
-
-// ===== src/tools/screenshot.rs - CORRECTED VERSION =====
+// src/tools/screenshot.rs
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use async_trait::async_trait;
