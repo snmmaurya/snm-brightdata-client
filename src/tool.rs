@@ -112,8 +112,9 @@ pub trait Tool {
         if let Some(raw) = result.raw_value {
             Ok(raw)
         } else if !result.content.is_empty() {
+            let content_text = &result.content[0].text;
             Ok(serde_json::json!({
-                "content": result.content[0].text
+                "content": content_text
             }))
         } else {
             Ok(serde_json::json!({}))
@@ -225,6 +226,22 @@ impl ToolResolver {
                 }
             }),
             serde_json::json!({
+                "name": "get_stock_data",
+                "description": "Stock search using BrightData",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": { "type": "string" },
+                        "engine": {
+                            "type": "string",
+                            "enum": ["google", "bing", "yandex", "duckduckgo"]
+                        },
+                        "cursor": { "type": "string" }
+                    }
+                }
+            }),
+            serde_json::json!({
                 "name": "multi_zone_search",
                 "description": "Multi-region search across zones",
                 "inputSchema": {
@@ -254,6 +271,7 @@ impl ToolResolver {
             "search_web", 
             "extract_data",
             "take_screenshot",
+            "get_stock_data",
             "get_crypto_data",
             "multi_zone_search"
         ]
