@@ -1,33 +1,54 @@
-// src/tools/financial.rs - Cleaned up version
+// src/tools/financial.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
+use crate::logger::JSON_LOGGER;
+use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use reqwest::Client;
 use std::time::Duration;
+use std::collections::HashMap;
 use log::{info, warn, error};
 use chrono::Utc;
 
-// Shared BrightData client for all financial tools
-async fn scrape_via_brightdata(url: &str, query: &str) -> Result<Value, BrightDataError> {
-    info!("🌐 BrightData request: {}", url);
+// ENHANCED: Priority-aware shared BrightData client for all financial tools
+async fn scrape_via_brightdata_with_priority(
+    url: &str, 
+    query: &str,
+    tool_type: &str,
+    priority: crate::filters::strategy::QueryPriority,
+    token_budget: usize,
+    execution_id: &str
+) -> Result<Value, BrightDataError> {
+    info!("🌐 Priority {} BrightData request: {} (execution: {})", 
+          format!("{:?}", priority), url, execution_id);
     
     let api_token = std::env::var("BRIGHTDATA_API_TOKEN")
         .or_else(|_| std::env::var("API_TOKEN"))
         .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
 
     let base_url = std::env::var("BRIGHTDATA_BASE_URL")
-        .unwrap_or_else(|_| "https://api.brightdata.com".to_string());
+        .unwrap_or_else(|| "https://api.brightdata.com".to_string());
 
     let zone = std::env::var("WEB_UNLOCKER_ZONE")
-        .unwrap_or_else(|_| "default".to_string());
+        .unwrap_or_else(|| "default".to_string());
 
-    let payload = json!({
+    let mut payload = json!({
         "url": url,
         "zone": zone,
         "format": "raw",
         "data_format": "markdown"
     });
+
+    // Add priority processing hints
+    if std::env::var("TRUNCATE_FILTER")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false) {
+        
+        payload["processing_priority"] = json!(format!("{:?}", priority));
+        payload["token_budget"] = json!(token_budget);
+        payload["tool_type"] = json!(tool_type);
+    }
 
     let client = Client::builder()
         .timeout(Duration::from_secs(90))
@@ -46,8 +67,27 @@ async fn scrape_via_brightdata(url: &str, query: &str) -> Result<Value, BrightDa
             BrightDataError::ToolError(format!("Request failed: {}", e))
         })?;
 
-    let status = response.status();
-    if !status.is_success() {
+    let status = response.status().as_u16();
+    let response_headers: HashMap<String, String> = response
+        .headers()
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+        .collect();
+
+    // Log BrightData request
+    if let Err(e) = JSON_LOGGER.log_brightdata_request(
+        execution_id,
+        &zone,
+        url,
+        payload.clone(),
+        status,
+        response_headers,
+        "markdown"
+    ).await {
+        warn!("Failed to log BrightData request: {}", e);
+    }
+
+    if !response.status().is_success() {
         let error_text = response.text().await.unwrap_or_default();
         error!("❌ HTTP Error {}: {}", status, error_text);
         return Err(BrightDataError::ToolError(format!(
@@ -55,18 +95,50 @@ async fn scrape_via_brightdata(url: &str, query: &str) -> Result<Value, BrightDa
         )));
     }
 
-    let content = response.text().await
+    let raw_content = response.text().await
         .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-    info!("✅ Request completed - {} chars", content.len());
+    // Apply filters conditionally based on environment variable with priority awareness
+    let filtered_content = if std::env::var("TRUNCATE_FILTER")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false) {
+        
+        if ResponseFilter::is_error_page(&raw_content) {
+            return Err(BrightDataError::ToolError("Request returned error page".into()));
+        } else if ResponseStrategy::should_try_next_source(&raw_content) {
+            return Err(BrightDataError::ToolError("Content quality too low".into()));
+        } else {
+            // Use token budget aware extraction
+            let max_tokens = token_budget / 2; // Reserve tokens for formatting
+            ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
+        }
+    } else {
+        raw_content.clone()
+    };
+
+    info!("✅ Request completed - {} chars (filtered: {} chars)", 
+          raw_content.len(), filtered_content.len());
     
     Ok(json!({
-        "content": content,
+        "content": filtered_content,
+        "raw_content": raw_content,
         "url": url,
         "query": query,
+        "tool_type": tool_type,
+        "priority": format!("{:?}", priority),
+        "token_budget": token_budget,
+        "execution_id": execution_id,
         "success": true,
         "timestamp": Utc::now().to_rfc3339()
     }))
+}
+
+// Legacy wrapper for compatibility
+async fn scrape_via_brightdata(url: &str, query: &str) -> Result<Value, BrightDataError> {
+    let execution_id = format!("legacy_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+    let priority = crate::filters::strategy::QueryPriority::Medium;
+    let token_budget = 5000;
+    scrape_via_brightdata_with_priority(url, query, "legacy", priority, token_budget, &execution_id).await
 }
 
 // Stock Data Tool
@@ -79,7 +151,7 @@ impl Tool for StockDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get comprehensive stock data including prices, performance, market cap, volumes"
+        "Get comprehensive stock data including prices, performance, market cap, volumes with intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -111,19 +183,74 @@ impl Tool for StockDataTool {
             .and_then(|v| v.as_str())
             .unwrap_or("indian");
 
-        info!("📊 Stock query: '{}' (market: {})", query, market);
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "stock", "validation", json!({}), response_type));
+            }
+
+            // Budget check for stock queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "stock", "budget_limit", json!({}), ResponseType::Skip));
+            }
+        }
+
+        let execution_id = format!("stock_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+
+        info!("📊 Priority {} stock query: '{}' (market: {}, execution: {})", 
+              format!("{:?}", query_priority), query, market, execution_id);
 
         let url = self.build_stock_url(query, market);
-        let result = scrape_via_brightdata(&url, query).await?;
+        
+        match scrape_via_brightdata_with_priority(&url, query, "stock", query_priority, recommended_tokens, &execution_id).await {
+            Ok(result) => {
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "stock", query, "stock", market, content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "📈 **Stock Data for: {}**\n\nMarket: {} | Priority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                        query, market, query_priority, recommended_tokens, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
 
-        let mcp_content = vec![McpContent::text(format!(
-            "📈 **Stock Data for: {}**\n\nMarket: {}\n\n{}",
-            query,
-            market,
-            result.get("content").and_then(|c| c.as_str()).unwrap_or("No data")
-        ))];
-
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(e) => {
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -172,7 +299,7 @@ impl Tool for CryptoDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get cryptocurrency data including prices, market cap, trading volumes"
+        "Get cryptocurrency data including prices, market cap, trading volumes with intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -194,18 +321,74 @@ impl Tool for CryptoDataTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'query' parameter".into()))?;
 
-        info!("💰 Crypto query: '{}'", query);
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "crypto", "validation", json!({}), response_type));
+            }
+
+            // Budget check for crypto queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "crypto", "budget_limit", json!({}), ResponseType::Skip));
+            }
+        }
+
+        let execution_id = format!("crypto_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+
+        info!("💰 Priority {} crypto query: '{}' (execution: {})", 
+              format!("{:?}", query_priority), query, execution_id);
 
         let url = self.build_crypto_url(query);
-        let result = scrape_via_brightdata(&url, query).await?;
+        
+        match scrape_via_brightdata_with_priority(&url, query, "crypto", query_priority, recommended_tokens, &execution_id).await {
+            Ok(result) => {
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "crypto", query, "crypto", "CoinMarketCap", content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "💰 **Crypto Data for: {}**\n\nPriority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                        query, query_priority, recommended_tokens, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
 
-        let mcp_content = vec![McpContent::text(format!(
-            "💰 **Crypto Data for: {}**\n\n{}",
-            query,
-            result.get("content").and_then(|c| c.as_str()).unwrap_or("No data")
-        ))];
-
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(e) => {
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -236,7 +419,7 @@ impl Tool for ETFDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get ETF and index fund data including NAV, holdings, performance, expense ratios"
+        "Get ETF and index fund data including NAV, holdings, performance, expense ratios with intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -268,17 +451,71 @@ impl Tool for ETFDataTool {
             .and_then(|v| v.as_str())
             .unwrap_or("indian");
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "etf", "validation", json!({}), response_type));
+            }
+
+            // Budget check for ETF queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "etf", "budget_limit", json!({}), ResponseType::Skip));
+            }
+        }
+
+        let execution_id = format!("etf_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+
         let url = self.build_etf_url(query, market);
-        let result = scrape_via_brightdata(&url, query).await?;
+        
+        match scrape_via_brightdata_with_priority(&url, query, "etf", query_priority, recommended_tokens, &execution_id).await {
+            Ok(result) => {
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "etf", query, "etf", market, content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "📊 **ETF Data for: {}**\n\nMarket: {} | Priority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                        query, market, query_priority, recommended_tokens, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
 
-        let mcp_content = vec![McpContent::text(format!(
-            "📊 **ETF Data for: {}**\n\nMarket: {}\n\n{}",
-            query,
-            market,
-            result.get("content").and_then(|c| c.as_str()).unwrap_or("No data")
-        ))];
-
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(e) => {
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -303,7 +540,7 @@ impl Tool for BondDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get bond market data including yields, government bonds, corporate bonds, and bond market trends"
+        "Get bond market data including yields, government bonds, corporate bonds, and bond market trends with intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -335,17 +572,71 @@ impl Tool for BondDataTool {
             .and_then(|v| v.as_str())
             .unwrap_or("indian");
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "bond", "validation", json!({}), response_type));
+            }
+
+            // Budget check for bond queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "bond", "budget_limit", json!({}), ResponseType::Skip));
+            }
+        }
+
+        let execution_id = format!("bond_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+
         let url = format!("https://www.investing.com/rates-bonds/?t={}", Utc::now().timestamp());
-        let result = scrape_via_brightdata(&url, query).await?;
+        
+        match scrape_via_brightdata_with_priority(&url, query, "bond", query_priority, recommended_tokens, &execution_id).await {
+            Ok(result) => {
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "bond", query, "bond", market, content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "🏛️ **Bond Data for: {}**\n\nMarket: {} | Priority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                        query, market, query_priority, recommended_tokens, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
 
-        let mcp_content = vec![McpContent::text(format!(
-            "🏛️ **Bond Data for: {}**\n\nMarket: {}\n\n{}",
-            query,
-            market,
-            result.get("content").and_then(|c| c.as_str()).unwrap_or("No data")
-        ))];
-
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(e) => {
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -359,7 +650,7 @@ impl Tool for MutualFundDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get mutual fund data including NAV, performance, portfolio composition, and fund comparisons"
+        "Get mutual fund data including NAV, performance, portfolio composition, and fund comparisons with intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -386,16 +677,71 @@ impl Tool for MutualFundDataTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'query' parameter".into()))?;
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "mutual_fund", "validation", json!({}), response_type));
+            }
+
+            // Budget check for mutual fund queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "mutual_fund", "budget_limit", json!({}), ResponseType::Skip));
+            }
+        }
+
+        let execution_id = format!("mf_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+
         let url = format!("https://www.valueresearchonline.com/funds/?t={}", Utc::now().timestamp());
-        let result = scrape_via_brightdata(&url, query).await?;
+        
+        match scrape_via_brightdata_with_priority(&url, query, "mutual_fund", query_priority, recommended_tokens, &execution_id).await {
+            Ok(result) => {
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "mutual_fund", query, "mutual_fund", "ValueResearch", content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "💼 **Mutual Fund Data for: {}**\n\nPriority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                        query, query_priority, recommended_tokens, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
 
-        let mcp_content = vec![McpContent::text(format!(
-            "💼 **Mutual Fund Data for: {}**\n\n{}",
-            query,
-            result.get("content").and_then(|c| c.as_str()).unwrap_or("No data")
-        ))];
-
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(e) => {
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -409,7 +755,7 @@ impl Tool for CommodityDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get commodity prices and market data including gold, silver, oil, agricultural commodities"
+        "Get commodity prices and market data including gold, silver, oil, agricultural commodities with intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -431,16 +777,71 @@ impl Tool for CommodityDataTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'query' parameter".into()))?;
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "commodity", "validation", json!({}), response_type));
+            }
+
+            // Budget check for commodity queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "commodity", "budget_limit", json!({}), ResponseType::Skip));
+            }
+        }
+
+        let execution_id = format!("commodity_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+
         let url = format!("https://www.investing.com/commodities/?t={}", Utc::now().timestamp());
-        let result = scrape_via_brightdata(&url, query).await?;
+        
+        match scrape_via_brightdata_with_priority(&url, query, "commodity", query_priority, recommended_tokens, &execution_id).await {
+            Ok(result) => {
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "commodity", query, "commodity", "Investing.com", content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "🥇 **Commodity Data for: {}**\n\nPriority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                        query, query_priority, recommended_tokens, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
 
-        let mcp_content = vec![McpContent::text(format!(
-            "🥇 **Commodity Data for: {}**\n\n{}",
-            query,
-            result.get("content").and_then(|c| c.as_str()).unwrap_or("No data")
-        ))];
-
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(e) => {
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }
 
@@ -454,7 +855,7 @@ impl Tool for MarketOverviewTool {
     }
 
     fn description(&self) -> &str {
-        "Get comprehensive market overview including major indices, sector performance, market sentiment, and overall market trends"
+        "Get comprehensive market overview including major indices, sector performance, market sentiment, and overall market trends with intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -488,16 +889,72 @@ impl Tool for MarketOverviewTool {
             .and_then(|v| v.as_str())
             .unwrap_or("indian");
 
+        let query = format!("{} market overview", market_type);
+
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(&query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(&query);
+
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", &query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", &query, "market_overview", "validation", json!({}), response_type));
+            }
+
+            // Budget check for market overview queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 150 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", &query, "market_overview", "budget_limit", json!({}), ResponseType::Skip));
+            }
+        }
+
+        let execution_id = format!("market_{}", Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+
         let url = format!("https://www.moneycontrol.com/?t={}", Utc::now().timestamp());
-        let result = scrape_via_brightdata(&url, &format!("{} market overview", market_type)).await?;
+        
+        match scrape_via_brightdata_with_priority(&url, &query, "market_overview", query_priority, recommended_tokens, &execution_id).await {
+            Ok(result) => {
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "market_overview", &query, "market", region, content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "🌍 **Market Overview: {} Market ({})**\n\nPriority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                        market_type.to_uppercase(), region.to_uppercase(), query_priority, recommended_tokens, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
 
-        let mcp_content = vec![McpContent::text(format!(
-            "🌍 **Market Overview: {} Market ({})**\n\n{}",
-            market_type.to_uppercase(),
-            region.to_uppercase(),
-            result.get("content").and_then(|c| c.as_str()).unwrap_or("No data")
-        ))];
-
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(e) => {
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(&query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 }

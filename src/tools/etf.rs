@@ -1,4 +1,4 @@
-// src/tools/etf.rs - Enhanced with BrightData SERP API parameters and optional filtering
+// src/tools/etf.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -122,6 +122,10 @@ impl Tool for ETFDataTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
         // Early validation using strategy only if TRUNCATE_FILTER is enabled
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
@@ -131,16 +135,23 @@ impl Tool for ETFDataTool {
             if matches!(response_type, ResponseType::Empty) {
                 return Ok(ResponseStrategy::create_response("", query, market, "validation", json!({}), response_type));
             }
+
+            // Budget check for ETF queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, market, "budget_limit", json!({}), ResponseType::Skip));
+            }
         }
 
         let execution_id = format!("etf_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
         
         let result = if use_serp_api {
-            self.fetch_etf_data_enhanced(
-                query, market, page, num_results, time_filter, etf_type, &data_points, &execution_id
+            self.fetch_etf_data_enhanced_with_priority(
+                query, market, page, num_results, time_filter, etf_type, &data_points, 
+                query_priority, recommended_tokens, &execution_id
             ).await?
         } else {
-            self.fetch_etf_data_legacy(query, market, &execution_id).await?
+            self.fetch_etf_data_legacy_with_priority(query, market, query_priority, recommended_tokens, &execution_id).await?
         };
 
         let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -164,11 +175,13 @@ impl Tool for ETFDataTool {
             
             let mcp_content = if use_serp_api {
                 vec![McpContent::text(format!(
-                    "📊 **Enhanced ETF Data for {}**\n\nMarket: {} | ETF Type: {} | Data Points: {:?}\nPage: {} | Results: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
+                    "📊 **Enhanced ETF Data for {}**\n\nMarket: {} | ETF Type: {} | Data Points: {:?} | Priority: {:?} | Tokens: {}\nPage: {} | Results: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
                     query,
                     market.to_uppercase(),
                     etf_type,
                     data_points,
+                    query_priority,
+                    recommended_tokens,
                     page,
                     num_results,
                     time_filter,
@@ -177,9 +190,11 @@ impl Tool for ETFDataTool {
                 ))]
             } else {
                 vec![McpContent::text(format!(
-                    "📊 **ETF Data for {}**\n\nMarket: {}\nExecution ID: {}\n\n{}",
+                    "📊 **ETF Data for {}**\n\nMarket: {} | Priority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
                     query,
                     market.to_uppercase(),
+                    query_priority,
+                    recommended_tokens,
                     execution_id,
                     content_text
                 ))]
@@ -199,7 +214,8 @@ impl Tool for ETFDataTool {
 }
 
 impl ETFDataTool {
-    async fn fetch_etf_data_enhanced(
+    // ENHANCED: Priority-aware ETF data fetching with token management
+    async fn fetch_etf_data_enhanced_with_priority(
         &self, 
         query: &str, 
         market: &str, 
@@ -208,6 +224,8 @@ impl ETFDataTool {
         time_filter: &str,
         etf_type: &str,
         data_points: &[&str],
+        query_priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str
     ) -> Result<Value, BrightDataError> {
         let api_token = env::var("BRIGHTDATA_API_TOKEN")
@@ -220,27 +238,37 @@ impl ETFDataTool {
         let zone = env::var("BRIGHTDATA_SERP_ZONE")
             .unwrap_or_else(|_| "serp_api2".to_string());
 
-        // Build enhanced search query
-        let search_query = self.build_etf_query(query, market, etf_type, data_points);
+        // Build enhanced search query with priority awareness
+        let search_query = self.build_etf_query_with_priority(query, market, etf_type, data_points, query_priority);
         
-        // Build enhanced query parameters
+        // Build enhanced query parameters with priority-based limits
         let mut query_params = HashMap::new();
         query_params.insert("q".to_string(), search_query.clone());
         
-        // Pagination
+        // Pagination (adjusted based on priority)
         if page > 1 {
             let start = (page - 1) * num_results;
             query_params.insert("start".to_string(), start.to_string());
         }
-        query_params.insert("num".to_string(), num_results.to_string());
+        
+        // Adjust results based on priority and token budget
+        let effective_num_results = match query_priority {
+            crate::filters::strategy::QueryPriority::Critical => num_results,
+            crate::filters::strategy::QueryPriority::High => std::cmp::min(num_results, 15),
+            crate::filters::strategy::QueryPriority::Medium => std::cmp::min(num_results, 10),
+            crate::filters::strategy::QueryPriority::Low => std::cmp::min(num_results, 5),
+        };
+        query_params.insert("num".to_string(), effective_num_results.to_string());
         
         // Localization based on market
         let (country, language) = self.get_market_settings(market);
-        query_params.insert("gl".to_string(), country.to_string());
+        if !country.is_empty() {
+            query_params.insert("gl".to_string(), country.to_string());
+        }
         query_params.insert("hl".to_string(), language.to_string());
         
-        // Time-based filtering
-        if time_filter != "any" {
+        // Time-based filtering (skip for low priority to save tokens)
+        if time_filter != "any" && !matches!(query_priority, crate::filters::strategy::QueryPriority::Low) {
             let tbs_value = match time_filter {
                 "day" => "qdr:d",
                 "week" => "qdr:w",
@@ -264,13 +292,24 @@ impl ETFDataTool {
             search_url = format!("{}?{}", search_url, query_string);
         }
 
-        let payload = json!({
+        let mut payload = json!({
             "url": search_url,
             "zone": zone,
             "format": "raw",
             "render": true,
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", query_priority));
+            payload["token_budget"] = json!(token_budget);
+            payload["focus_data_points"] = json!(data_points);
+            payload["etf_focus"] = json!(etf_type);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -317,7 +356,7 @@ impl ETFDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters conditionally based on environment variable
+        // Apply filters conditionally based on environment variable with priority awareness
         let filtered_content = if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
@@ -327,14 +366,16 @@ impl ETFDataTool {
             } else if ResponseStrategy::should_try_next_source(&raw_content) {
                 return Err(BrightDataError::ToolError("Content quality too low".into()));
             } else {
-                ResponseFilter::filter_financial_content(&raw_content)
+                // Use enhanced extraction with token budget awareness
+                let max_tokens = token_budget / 3; // Reserve tokens for formatting
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
             }
         } else {
             raw_content.clone()
         };
 
-        // Format the results
-        let formatted_content = self.format_etf_results(&filtered_content, query, market, etf_type, data_points, page, num_results);
+        // Format the results with priority awareness
+        let formatted_content = self.format_etf_results_with_priority(&filtered_content, query, market, etf_type, data_points, page, effective_num_results, query_priority);
 
         Ok(json!({
             "content": filtered_content,
@@ -344,18 +385,20 @@ impl ETFDataTool {
             "market": market,
             "etf_type": etf_type,
             "data_points": data_points,
+            "priority": format!("{:?}", query_priority),
+            "token_budget": token_budget,
             "page": page,
-            "num_results": num_results,
+            "num_results": effective_num_results,
             "time_filter": time_filter,
             "zone": zone,
             "execution_id": execution_id,
             "raw_response": raw_content,
             "success": true,
-            "api_type": "enhanced_serp"
+            "api_type": "enhanced_priority_serp"
         }))
     }
 
-    async fn fetch_etf_data_legacy(&self, query: &str, market: &str, execution_id: &str) -> Result<Value, BrightDataError> {
+    async fn fetch_etf_data_legacy_with_priority(&self, query: &str, market: &str, priority: crate::filters::strategy::QueryPriority, token_budget: usize, execution_id: &str) -> Result<Value, BrightDataError> {
         let api_token = env::var("BRIGHTDATA_API_TOKEN")
             .or_else(|_| env::var("API_TOKEN"))
             .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
@@ -373,12 +416,21 @@ impl ETFDataTool {
             _ => format!("https://www.google.com/search?q={} ETF performance NAV", urlencoding::encode(query))
         };
 
-        let payload = json!({
+        let mut payload = json!({
             "url": search_url,
             "zone": zone,
             "format": "raw",
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -425,7 +477,7 @@ impl ETFDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters conditionally
+        // Apply filters conditionally with priority awareness
         let filtered_content = if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
@@ -433,7 +485,8 @@ impl ETFDataTool {
             if ResponseFilter::is_error_page(&raw_content) {
                 return Err(BrightDataError::ToolError("ETF search returned error page".into()));
             } else {
-                ResponseFilter::filter_financial_content(&raw_content)
+                let max_tokens = token_budget / 2;
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
             }
         } else {
             raw_content.clone()
@@ -443,53 +496,75 @@ impl ETFDataTool {
             "content": filtered_content,
             "query": query,
             "market": market,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget,
             "execution_id": execution_id,
             "success": true,
-            "api_type": "legacy"
+            "api_type": "legacy_priority"
         }))
     }
 
-    fn build_etf_query(&self, query: &str, market: &str, etf_type: &str, data_points: &[&str]) -> String {
+    // ENHANCED: Priority-aware ETF query building
+    fn build_etf_query_with_priority(&self, query: &str, market: &str, etf_type: &str, data_points: &[&str], priority: crate::filters::strategy::QueryPriority) -> String {
         let mut search_terms = vec![query.to_string()];
         
         // Add ETF identifier
         search_terms.push("ETF".to_string());
         
-        // Add ETF type if specified
-        if etf_type != "any" {
+        // Priority-based term selection
+        match priority {
+            crate::filters::strategy::QueryPriority::Critical => {
+                // Focus on current, real-time data for critical queries
+                search_terms.extend_from_slice(&["current".to_string(), "live".to_string(), "price".to_string()]);
+                for data_point in data_points.iter().take(2) { // Limit data points for focus
+                    match *data_point {
+                        "price" => search_terms.push("price".to_string()),
+                        "nav" => search_terms.push("NAV".to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            crate::filters::strategy::QueryPriority::High => {
+                // Include key ETF data points
+                for data_point in data_points.iter().take(3) {
+                    match *data_point {
+                        "price" => search_terms.push("price".to_string()),
+                        "nav" => search_terms.push("NAV".to_string()),
+                        "performance" => search_terms.push("performance".to_string()),
+                        "expense_ratio" => search_terms.push("expense ratio".to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {
+                // General terms for lower priority
+                search_terms.push("overview".to_string());
+            }
+        }
+        
+        // Add ETF type if specified and priority allows
+        if etf_type != "any" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
             search_terms.push(format!("{} ETF", etf_type));
         }
         
-        // Add data points as search terms
-        for data_point in data_points {
-            match *data_point {
-                "price" => search_terms.push("price".to_string()),
-                "nav" => search_terms.push("NAV".to_string()),
-                "holdings" => search_terms.push("holdings".to_string()),
-                "performance" => search_terms.push("performance".to_string()),
-                "expense_ratio" => search_terms.push("expense ratio".to_string()),
-                "volume" => search_terms.push("volume".to_string()),
-                "dividend" => search_terms.push("dividend".to_string()),
+        // Add market-specific terms (only for higher priority)
+        if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
+            match market {
+                "indian" => {
+                    search_terms.extend_from_slice(&[
+                        "india".to_string(),
+                        "NSE".to_string(),
+                        "BSE".to_string()
+                    ]);
+                }
+                "us" => {
+                    search_terms.push("US".to_string());
+                }
+                "global" => {
+                    search_terms.push("global".to_string());
+                }
                 _ => {}
             }
-        }
-        
-        // Add market-specific terms
-        match market {
-            "indian" => {
-                search_terms.extend_from_slice(&[
-                    "india".to_string(),
-                    "NSE".to_string(),
-                    "BSE".to_string()
-                ]);
-            }
-            "us" => {
-                search_terms.push("US".to_string());
-            }
-            "global" => {
-                search_terms.push("global".to_string());
-            }
-            _ => {}
         }
         
         search_terms.join(" ")
@@ -502,6 +577,24 @@ impl ETFDataTool {
             "global" => ("", "en"),
             _ => ("us", "en")
         }
+    }
+
+    // ENHANCED: Priority-aware result formatting
+    fn format_etf_results_with_priority(&self, content: &str, query: &str, market: &str, etf_type: &str, data_points: &[&str], page: u32, num_results: u32, priority: crate::filters::strategy::QueryPriority) -> String {
+        // Check if we need compact formatting
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            // Ultra-compact formatting for filtered mode
+            return format!("📊 {}: {}", 
+                ResponseStrategy::ultra_abbreviate_query(query), 
+                content
+            );
+        }
+
+        // Regular formatting for non-filtered mode
+        self.format_etf_results(content, query, market, etf_type, data_points, page, num_results)
     }
 
     fn format_etf_results(&self, content: &str, query: &str, market: &str, etf_type: &str, data_points: &[&str], page: u32, num_results: u32) -> String {

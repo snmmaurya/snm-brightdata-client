@@ -1,4 +1,4 @@
-// src/tools/crypto.rs - Enhanced with BrightData SERP API parameters and filters
+// src/tools/crypto.rs - Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -38,10 +38,10 @@ impl Tool for CryptoDataTool {
                 },
                 "num_results": {
                     "type": "integer",
-                    "description": "Number of results per page (10-100)",
-                    "minimum": 1,
-                    "maximum": 1,
-                    "default": 1
+                    "description": "Number of results per page (5-50)",
+                    "minimum": 5,
+                    "maximum": 50,
+                    "default": 20
                 },
                 "time_filter": {
                     "type": "string",
@@ -78,6 +78,11 @@ impl Tool for CryptoDataTool {
             },
             "required": ["query"]
         })
+    }
+
+    // FIXED: Add the missing execute method that delegates to execute_internal
+    async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+        self.execute_internal(parameters).await
     }
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
@@ -122,60 +127,78 @@ impl Tool for CryptoDataTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
         // Early validation
-        let response_type = ResponseStrategy::determine_response_type("", query);
-        if matches!(response_type, ResponseType::Empty) {
-            return Ok(ResponseStrategy::create_response("", query, "crypto", "validation", json!({}), response_type));
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "crypto", "validation", json!({}), response_type));
+            }
+
+            // Budget check for crypto queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "crypto", "budget_limit", json!({}), ResponseType::Skip));
+            }
         }
 
         let execution_id = format!("crypto_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
         
         let result = if use_serp_api {
-            self.fetch_crypto_data_enhanced(
-                query, page, num_results, time_filter, crypto_type, &data_points, safe_search, &execution_id
+            self.fetch_crypto_data_enhanced_with_priority(
+                query, page, num_results, time_filter, crypto_type, &data_points, 
+                safe_search, query_priority, recommended_tokens, &execution_id
             ).await?
         } else {
-            self.fetch_crypto_data_legacy(query, &execution_id).await?
+            self.fetch_crypto_data_legacy_with_priority(query, query_priority, recommended_tokens, &execution_id).await?
         };
 
         let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let source_used = if use_serp_api { "Enhanced SERP" } else { "Legacy" };
         
-        let content_text = if use_serp_api {
-            result.get("formatted_content").and_then(|c| c.as_str()).unwrap_or(content)
+        // Create appropriate response based on whether filtering is enabled
+        let tool_result = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            ResponseStrategy::create_financial_response(
+                "crypto", query, "crypto", source_used, content, result.clone()
+            )
         } else {
-            content
-        };
-        
-        let mcp_content = if use_serp_api {
-            vec![McpContent::text(format!(
-                "💰 **Enhanced Crypto Data for {}**\n\nCrypto Type: {} | Data Points: {:?}\nPage: {} | Results: {} | Time Filter: {} | Safe Search: {}\nExecution ID: {}\n\n{}",
-                query,
-                crypto_type,
-                data_points,
-                page,
-                num_results,
-                time_filter,
-                safe_search,
-                execution_id,
-                content_text
-            ))]
-        } else {
-            vec![McpContent::text(format!(
-                "💰 **Crypto Data for {}**\n\nExecution ID: {}\n\n{}",
-                query,
-                execution_id,
-                content_text
-            ))]
+            // No filtering - create standard response
+            let content_text = if use_serp_api {
+                result.get("formatted_content").and_then(|c| c.as_str()).unwrap_or(content)
+            } else {
+                content
+            };
+
+            let mcp_content = vec![McpContent::text(format!(
+                "💰 **Enhanced Crypto Data for {}**\n\nCrypto Type: {} | Priority: {:?} | Tokens: {} | Data Points: {:?}\nPage: {} | Results: {} | Time Filter: {} | Safe Search: {}\nExecution ID: {}\n\n{}",
+                query, crypto_type, query_priority, recommended_tokens, data_points, page, num_results, time_filter, safe_search, execution_id, content_text
+            ))];
+            ToolResult::success_with_raw(mcp_content, result)
         };
 
-        // Use filters to create appropriate response
-        let tool_result = ToolResult::success_with_raw(mcp_content, result);
-        Ok(ResponseStrategy::apply_size_limits(tool_result))
+        // Apply size limits only if filtering enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            Ok(ResponseStrategy::apply_size_limits(tool_result))
+        } else {
+            Ok(tool_result)
+        }
     }
 }
 
 impl CryptoDataTool {
-    async fn fetch_crypto_data_enhanced(
+    // ENHANCED: Priority-aware crypto data fetching
+    async fn fetch_crypto_data_enhanced_with_priority(
         &self, 
         query: &str, 
         page: u32,
@@ -184,6 +207,8 @@ impl CryptoDataTool {
         crypto_type: &str,
         data_points: &[&str],
         safe_search: &str,
+        query_priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str
     ) -> Result<Value, BrightDataError> {
         let api_token = env::var("BRIGHTDATA_API_TOKEN")
@@ -196,8 +221,16 @@ impl CryptoDataTool {
         let zone = env::var("BRIGHTDATA_SERP_ZONE")
             .unwrap_or_else(|_| "serp_api2".to_string());
 
-        // Build enhanced search query
-        let search_query = self.build_crypto_query(query, crypto_type, data_points);
+        // Build enhanced search query with priority awareness
+        let search_query = self.build_priority_aware_crypto_query(query, crypto_type, data_points, query_priority);
+        
+        // ENHANCED: Adjust results based on priority and token budget
+        let effective_num_results = match query_priority {
+            crate::filters::strategy::QueryPriority::Critical => num_results,
+            crate::filters::strategy::QueryPriority::High => std::cmp::min(num_results, 25),
+            crate::filters::strategy::QueryPriority::Medium => std::cmp::min(num_results, 15),
+            crate::filters::strategy::QueryPriority::Low => std::cmp::min(num_results, 10),
+        };
         
         // Build enhanced query parameters
         let mut query_params = HashMap::new();
@@ -205,10 +238,10 @@ impl CryptoDataTool {
         
         // Pagination
         if page > 1 {
-            let start = (page - 1) * num_results;
+            let start = (page - 1) * effective_num_results;
             query_params.insert("start".to_string(), start.to_string());
         }
-        query_params.insert("num".to_string(), num_results.to_string());
+        query_params.insert("num".to_string(), effective_num_results.to_string());
         
         // Global settings for crypto (not region-specific)
         query_params.insert("gl".to_string(), "us".to_string());
@@ -222,8 +255,8 @@ impl CryptoDataTool {
         };
         query_params.insert("safe".to_string(), safe_value.to_string());
         
-        // Time-based filtering
-        if time_filter != "any" {
+        // Time-based filtering (skip for low priority to save tokens)
+        if time_filter != "any" && !matches!(query_priority, crate::filters::strategy::QueryPriority::Low) {
             let tbs_value = match time_filter {
                 "hour" => "qdr:h",
                 "day" => "qdr:d", 
@@ -248,13 +281,24 @@ impl CryptoDataTool {
             search_url = format!("{}?{}", search_url, query_string);
         }
 
-        let payload = json!({
+        let mut payload = json!({
             "url": search_url,
             "zone": zone,
             "format": "raw",
             "render": true,
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", query_priority));
+            payload["token_budget"] = json!(token_budget);
+            payload["focus_data_points"] = json!(data_points);
+            payload["crypto_focus"] = json!(crypto_type);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -298,37 +342,52 @@ impl CryptoDataTool {
             )));
         }
 
-        let content = response.text().await
+        let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Use filters to validate content before processing
-        if ResponseStrategy::should_try_next_source(&content) {
-            return Err(BrightDataError::ToolError("Content quality too low".into()));
-        }
+        // ENHANCED: Apply priority-based filtering with token awareness
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError("Enhanced crypto search returned error page".into()));
+            } else if ResponseStrategy::should_try_next_source(&raw_content) {
+                return Err(BrightDataError::ToolError("Content quality too low".into()));
+            } else {
+                // Use enhanced extraction with token budget awareness
+                let max_tokens = token_budget / 3; // Reserve tokens for formatting
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
+            }
+        } else {
+            raw_content.clone()
+        };
 
-        // Format the results
-        let formatted_content = self.format_crypto_results(&content, query, crypto_type, data_points, page, num_results, time_filter);
+        // Format the results with priority awareness
+        let formatted_content = self.format_crypto_results_with_priority(&filtered_content, query, crypto_type, data_points, page, effective_num_results, time_filter, query_priority);
 
         Ok(json!({
-            "content": content,
+            "content": filtered_content,
             "formatted_content": formatted_content,
             "query": query,
             "search_query": search_query,
             "crypto_type": crypto_type,
             "data_points": data_points,
+            "priority": format!("{:?}", query_priority),
+            "token_budget": token_budget,
             "page": page,
-            "num_results": num_results,
+            "num_results": effective_num_results,
             "time_filter": time_filter,
             "safe_search": safe_search,
             "zone": zone,
             "execution_id": execution_id,
-            "raw_response": content,
+            "raw_response": raw_content,
             "success": true,
-            "api_type": "enhanced_serp"
+            "api_type": "enhanced_priority_serp"
         }))
     }
 
-    async fn fetch_crypto_data_legacy(&self, query: &str, execution_id: &str) -> Result<Value, BrightDataError> {
+    async fn fetch_crypto_data_legacy_with_priority(&self, query: &str, priority: crate::filters::strategy::QueryPriority, token_budget: usize, execution_id: &str) -> Result<Value, BrightDataError> {
         let api_token = env::var("BRIGHTDATA_API_TOKEN")
             .or_else(|_| env::var("API_TOKEN"))
             .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
@@ -344,12 +403,21 @@ impl CryptoDataTool {
             urlencoding::encode(query)
         );
 
-        let payload = json!({
+        let mut payload = json!({
             "url": search_url,
             "zone": zone,
             "format": "raw",
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -393,31 +461,84 @@ impl CryptoDataTool {
             )));
         }
 
-        let content = response.text().await
+        let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Use filters to validate content before returning
-        if ResponseStrategy::should_try_next_source(&content) {
-            return Err(BrightDataError::ToolError("Content quality too low".into()));
-        }
+        // Apply filters with priority awareness
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError("Crypto search returned error page".into()));
+            } else {
+                let max_tokens = token_budget / 2;
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
+            }
+        } else {
+            raw_content.clone()
+        };
 
         Ok(json!({
-            "content": content,
+            "content": filtered_content,
             "query": query,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget,
             "execution_id": execution_id,
             "success": true,
-            "api_type": "legacy"
+            "api_type": "legacy_priority"
         }))
     }
 
-    fn build_crypto_query(&self, query: &str, crypto_type: &str, data_points: &[&str]) -> String {
+    // ENHANCED: Priority-aware crypto query building
+    fn build_priority_aware_crypto_query(&self, query: &str, crypto_type: &str, data_points: &[&str], priority: crate::filters::strategy::QueryPriority) -> String {
         let mut search_terms = vec![query.to_string()];
         
         // Add cryptocurrency identifier
         search_terms.push("cryptocurrency".to_string());
         
-        // Add crypto type if specified
-        if crypto_type != "any" {
+        // Priority-based term selection
+        match priority {
+            crate::filters::strategy::QueryPriority::Critical => {
+                // Focus on current, real-time data for critical queries
+                search_terms.extend_from_slice(&["price".to_string(), "current".to_string(), "live".to_string()]);
+                for data_point in data_points.iter().take(2) { // Limit data points for focus
+                    match *data_point {
+                        "price" => search_terms.push("price".to_string()),
+                        "market_cap" => search_terms.push("market cap".to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            crate::filters::strategy::QueryPriority::High => {
+                // Include key metrics
+                search_terms.extend_from_slice(&["price".to_string(), "market cap".to_string()]);
+                for data_point in data_points.iter().take(3) {
+                    match *data_point {
+                        "volume" => search_terms.push("volume".to_string()),
+                        "change" => search_terms.push("change".to_string()),
+                        _ => {}
+                    }
+                }
+            }
+            crate::filters::strategy::QueryPriority::Medium => {
+                // Basic financial terms
+                search_terms.extend_from_slice(&["price".to_string(), "market".to_string()]);
+                if crypto_type != "any" {
+                    search_terms.push(crypto_type.to_string());
+                }
+            }
+            crate::filters::strategy::QueryPriority::Low => {
+                // General terms for lower priority
+                if crypto_type != "any" {
+                    search_terms.push(crypto_type.to_string());
+                }
+                search_terms.push("overview".to_string());
+            }
+        }
+        
+        // Add crypto type if specified and priority allows
+        if crypto_type != "any" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
             match crypto_type {
                 "bitcoin" => search_terms.push("bitcoin BTC".to_string()),
                 "altcoins" => search_terms.push("altcoins ethereum".to_string()),
@@ -428,27 +549,33 @@ impl CryptoDataTool {
             }
         }
         
-        // Add data points as search terms
-        for data_point in data_points {
-            match *data_point {
-                "price" => search_terms.push("price".to_string()),
-                "market_cap" => search_terms.push("market cap".to_string()),
-                "volume" => search_terms.push("volume".to_string()),
-                "change" => search_terms.push("change percentage".to_string()),
-                "supply" => search_terms.push("supply circulating".to_string()),
-                "dominance" => search_terms.push("dominance".to_string()),
-                "fear_greed" => search_terms.push("fear greed index".to_string()),
-                _ => {}
-            }
+        // Add popular crypto data sources (only for high priority to save tokens)
+        if matches!(priority, crate::filters::strategy::QueryPriority::Critical | crate::filters::strategy::QueryPriority::High) {
+            search_terms.extend_from_slice(&[
+                "coinmarketcap".to_string(),
+                "coingecko".to_string()
+            ]);
         }
         
-        // Add popular crypto data sources
-        search_terms.extend_from_slice(&[
-            "coinmarketcap".to_string(),
-            "coingecko".to_string()
-        ]);
-        
         search_terms.join(" ")
+    }
+
+    // ENHANCED: Priority-aware result formatting
+    fn format_crypto_results_with_priority(&self, content: &str, query: &str, crypto_type: &str, data_points: &[&str], page: u32, num_results: u32, time_filter: &str, priority: crate::filters::strategy::QueryPriority) -> String {
+        // Check if we need compact formatting
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            // Ultra-compact formatting for filtered mode
+            return format!("💰 {}: {}", 
+                ResponseStrategy::ultra_abbreviate_query(query), 
+                content
+            );
+        }
+
+        // Regular formatting for non-filtered mode
+        self.format_crypto_results(content, query, crypto_type, data_points, page, num_results, time_filter)
     }
 
     fn format_crypto_results(&self, content: &str, query: &str, crypto_type: &str, data_points: &[&str], page: u32, num_results: u32, time_filter: &str) -> String {

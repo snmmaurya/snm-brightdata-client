@@ -1,4 +1,4 @@
-// src/tools/search.rs - Enhanced with BrightData SERP API parameters and optional filtering
+// src/tools/search.rs - COMPLETE PATCHED VERSION with enhanced token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use reqwest::Client;
 use std::time::Duration;
 use std::collections::HashMap;
-use log::info;
+use log::{info, warn};
 
 pub struct SearchEngine;
 
@@ -19,7 +19,7 @@ impl Tool for SearchEngine {
     }
 
     fn description(&self) -> &str {
-        "Search the web using various search engines via BrightData SERP API with pagination and advanced parameters"
+        "Search the web using various search engines via BrightData SERP API with pagination, advanced parameters, and intelligent filtering"
     }
 
     fn input_schema(&self) -> Value {
@@ -40,15 +40,15 @@ impl Tool for SearchEngine {
                     "type": "integer",
                     "description": "Page number for pagination (1-based)",
                     "minimum": 1,
-                    "maximum": 1,
+                    "maximum": 5,
                     "default": 1
                 },
                 "num_results": {
                     "type": "integer", 
-                    "description": "Number of results per page (10-100)",
-                    "minimum": 1,
-                    "maximum": 1,
-                    "default": 1
+                    "description": "Number of results per page (5-50)",
+                    "minimum": 5,
+                    "maximum": 50,
+                    "default": 20
                 },
                 "country": {
                     "type": "string",
@@ -88,6 +88,11 @@ impl Tool for SearchEngine {
         })
     }
 
+    // FIXED: Add the missing execute method that delegates to execute_internal
+    async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+        self.execute_internal(parameters).await
+    }
+
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let query = parameters
             .get("query")
@@ -107,7 +112,7 @@ impl Tool for SearchEngine {
         let num_results = parameters
             .get("num_results")
             .and_then(|v| v.as_i64())
-            .unwrap_or(10) as u32;
+            .unwrap_or(20) as u32;
 
         let country = parameters
             .get("country")
@@ -139,6 +144,10 @@ impl Tool for SearchEngine {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
         // Early validation using strategy only if TRUNCATE_FILTER is enabled
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
@@ -148,18 +157,28 @@ impl Tool for SearchEngine {
             if matches!(response_type, ResponseType::Empty) {
                 return Ok(ResponseStrategy::create_response("", query, "search", "validation", json!({}), response_type));
             }
+
+            // Budget check for search queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "search", "budget_limit", json!({}), ResponseType::Skip));
+            }
         }
 
         let execution_id = self.generate_execution_id();
         
+        info!("🔍 Search query: '{}' (engine: {}, priority: {:?}, tokens: {})", 
+              query, engine, query_priority, recommended_tokens);
+        
         let result = if use_serp_api {
-            self.search_with_brightdata_serp_api(
+            self.search_with_brightdata_serp_api_with_priority(
                 query, engine, page, num_results, country, language,
-                safe_search, time_filter, search_type, &execution_id
+                safe_search, time_filter, search_type, query_priority, 
+                recommended_tokens, &execution_id
             ).await?
         } else {
-            // Fallback to original method
-            self.search_with_brightdata(query, engine, &execution_id).await?
+            // Fallback to original method with priority
+            self.search_with_brightdata_with_priority(query, engine, query_priority, recommended_tokens, &execution_id).await?
         };
 
         let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -183,13 +202,13 @@ impl Tool for SearchEngine {
 
             let mcp_content = if use_serp_api {
                 vec![McpContent::text(format!(
-                    "🔍 **Enhanced Search Results for '{}'**\n\nEngine: {} | Page: {} | Results: {} | Country: {} | Language: {}\nSearch Type: {} | Safe Search: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
-                    query, engine, page, num_results, country, language, search_type, safe_search, time_filter, execution_id, content_text
+                    "🔍 **Enhanced Search Results for '{}'**\n\nEngine: {} | Page: {} | Results: {} | Country: {} | Language: {} | Priority: {:?} | Tokens: {}\nSearch Type: {} | Safe Search: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
+                    query, engine, page, num_results, country, language, query_priority, recommended_tokens, search_type, safe_search, time_filter, execution_id, content_text
                 ))]
             } else {
                 vec![McpContent::text(format!(
-                    "🔍 **Search Results for '{}'**\n\nEngine: {}\nExecution ID: {}\n\n{}",
-                    query, engine, execution_id, content_text
+                    "🔍 **Search Results for '{}'**\n\nEngine: {} | Priority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
+                    query, engine, query_priority, recommended_tokens, execution_id, content_text
                 ))]
             };
             ToolResult::success_with_raw(mcp_content, result)
@@ -211,8 +230,157 @@ impl SearchEngine {
         format!("search_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"))
     }
 
-    // Enhanced method using BrightData SERP API
-    async fn search_with_brightdata_serp_api(
+    // ENHANCED: Token-aware response handling with priority management
+    async fn handle_brightdata_response_with_priority(
+        &self,
+        raw_content: String,
+        query: &str,
+        engine: &str,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
+        execution_id: &str,
+    ) -> Result<Value, BrightDataError> {
+        
+        // Step 1: Check if filtering is enabled
+        if !std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            // No filtering - return as-is
+            return Ok(json!({
+                "content": raw_content,
+                "formatted_content": self.format_search_results(&raw_content, query, 1, 20, "web"),
+                "query": query,
+                "engine": engine,
+                "priority": format!("{:?}", priority),
+                "token_budget": token_budget,
+                "execution_id": execution_id,
+                "success": true,
+                "api_type": "no_filter"
+            }));
+        }
+
+        // Step 2: Determine response type based on content quality and priority
+        let response_type = ResponseStrategy::determine_response_type(&raw_content, query);
+        
+        // Step 3: Apply priority-aware filtering based on response type
+        match response_type {
+            ResponseType::Skip => {
+                // Return minimal response, don't even process content
+                return Err(BrightDataError::ToolError("Skipping low quality search source".into()));
+            }
+            
+            ResponseType::Emergency => {
+                // Extract only the most essential data (10-15 tokens max)
+                let max_tokens = std::cmp::min(token_budget / 4, 15);
+                let emergency_content = ResponseFilter::extract_high_value_financial_data(
+                    &raw_content, 
+                    max_tokens
+                );
+                
+                return Ok(json!({
+                    "content": emergency_content,
+                    "formatted_content": emergency_content,
+                    "response_type": "emergency",
+                    "query": query,
+                    "engine": engine,
+                    "priority": format!("{:?}", priority),
+                    "token_budget": token_budget,
+                    "execution_id": execution_id,
+                    "success": true,
+                    "api_type": "emergency_serp"
+                }));
+            }
+            
+            ResponseType::KeyMetrics => {
+                // Extract only key metrics (20-40 tokens max)
+                let max_tokens = std::cmp::min(token_budget / 3, 40);
+                let metrics_content = ResponseFilter::extract_high_value_financial_data(
+                    &raw_content, 
+                    max_tokens
+                );
+                
+                return Ok(json!({
+                    "content": metrics_content,
+                    "formatted_content": metrics_content,
+                    "response_type": "key_metrics", 
+                    "query": query,
+                    "engine": engine,
+                    "priority": format!("{:?}", priority),
+                    "token_budget": token_budget,
+                    "execution_id": execution_id,
+                    "success": true,
+                    "api_type": "metrics_serp"
+                }));
+            }
+            
+            ResponseType::Summary => {
+                // Create ultra-compact summary (40-60 tokens max)
+                let max_chars = std::cmp::min(token_budget * 4 / 2, 200); // Reserve half tokens for formatting
+                let summary_content = ResponseFilter::smart_truncate_preserving_financial_data(
+                    &raw_content,
+                    max_chars
+                );
+                
+                let formatted_content = self.format_search_results_with_priority(&summary_content, query, 1, 1, "web", priority);
+                
+                return Ok(json!({
+                    "content": summary_content,
+                    "formatted_content": formatted_content,
+                    "response_type": "summary",
+                    "query": query,
+                    "engine": engine,
+                    "priority": format!("{:?}", priority),
+                    "token_budget": token_budget,
+                    "execution_id": execution_id,
+                    "success": true,
+                    "api_type": "summary_serp"
+                }));
+            }
+            
+            ResponseType::Filtered => {
+                // Apply aggressive filtering (60-100 tokens max)
+                let filtered_content = ResponseFilter::filter_financial_content(&raw_content);
+                let max_chars = std::cmp::min(token_budget * 4 / 2, 400);
+                let truncated_content = ResponseFilter::truncate_content(&filtered_content, max_chars);
+                
+                let formatted_content = self.format_search_results_with_priority(&truncated_content, query, 1, 10, "web", priority);
+                
+                return Ok(json!({
+                    "content": truncated_content,
+                    "formatted_content": formatted_content,
+                    "response_type": "filtered",
+                    "query": query,
+                    "engine": engine,
+                    "priority": format!("{:?}", priority),
+                    "token_budget": token_budget,
+                    "execution_id": execution_id,
+                    "success": true,
+                    "api_type": "filtered_serp"
+                }));
+            }
+            
+            _ => {
+                // Fallback - should not happen
+                let max_tokens = std::cmp::min(token_budget / 4, 20);
+                let minimal_content = ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens);
+                return Ok(json!({
+                    "content": minimal_content,
+                    "formatted_content": minimal_content,
+                    "response_type": "fallback",
+                    "query": query,
+                    "engine": engine,
+                    "priority": format!("{:?}", priority),
+                    "token_budget": token_budget,
+                    "execution_id": execution_id,
+                    "success": true,
+                    "api_type": "fallback_serp"
+                }));
+            }
+        }
+    }
+
+    // ENHANCED: Priority-aware SERP API search with comprehensive token management
+    async fn search_with_brightdata_serp_api_with_priority(
         &self,
         query: &str,
         engine: &str,
@@ -223,6 +391,8 @@ impl SearchEngine {
         safe_search: &str,
         time_filter: &str,
         search_type: &str,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str,
     ) -> Result<Value, BrightDataError> {
         let api_token = std::env::var("BRIGHTDATA_API_TOKEN")
@@ -235,16 +405,24 @@ impl SearchEngine {
         let zone = std::env::var("BRIGHTDATA_SERP_ZONE")
             .unwrap_or_else(|_| "serp_api2".to_string());
 
+        // ENHANCED: Adjust search parameters based on priority and token budget
+        let effective_num_results = match priority {
+            crate::filters::strategy::QueryPriority::Critical => num_results,
+            crate::filters::strategy::QueryPriority::High => std::cmp::min(num_results, 30),
+            crate::filters::strategy::QueryPriority::Medium => std::cmp::min(num_results, 20),
+            crate::filters::strategy::QueryPriority::Low => std::cmp::min(num_results, 10),
+        };
+
         // Build query parameters based on BrightData SERP API documentation
         let mut query_params = HashMap::new();
         query_params.insert("q".to_string(), query.to_string());
         
         // Pagination
         if page > 1 {
-            let start = (page - 1) * num_results;
+            let start = (page - 1) * effective_num_results;
             query_params.insert("start".to_string(), start.to_string());
         }
-        query_params.insert("num".to_string(), num_results.to_string());
+        query_params.insert("num".to_string(), effective_num_results.to_string());
         
         // Localization
         query_params.insert("gl".to_string(), country.to_string()); // Geographic location
@@ -258,8 +436,8 @@ impl SearchEngine {
         };
         query_params.insert("safe".to_string(), safe_value.to_string());
         
-        // Time-based filtering
-        if time_filter != "any" {
+        // Time-based filtering (skip for low priority to save tokens)
+        if time_filter != "any" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
             let tbs_value = match time_filter {
                 "hour" => "qdr:h",
                 "day" => "qdr:d",
@@ -273,8 +451,8 @@ impl SearchEngine {
             }
         }
         
-        // Search type (tbm parameter)
-        if search_type != "web" {
+        // Search type (tbm parameter) - only for higher priority queries
+        if search_type != "web" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
             let tbm_value = match search_type {
                 "images" => "isch",
                 "videos" => "vid",
@@ -287,8 +465,8 @@ impl SearchEngine {
             }
         }
 
-        info!("🔍 Enhanced SERP API search: {} (engine: {}, page: {}, results: {}, country: {}) using zone: {} (execution: {})", 
-              query, engine, page, num_results, country, zone, execution_id);
+        info!("🔍 Priority {} enhanced SERP API search: {} (engine: {}, page: {}, results: {}, country: {}) using zone: {} (execution: {})", 
+              format!("{:?}", priority), query, engine, page, effective_num_results, country, zone, execution_id);
 
         // Build URL with query parameters for BrightData SERP API
         let mut search_url = self.get_base_search_url(engine);
@@ -302,13 +480,22 @@ impl SearchEngine {
         }
 
         // Use BrightData SERP API payload with URL containing parameters
-        let payload = json!({
+        let mut payload = json!({
             "url": search_url,
             "zone": zone,
             "format": "raw",
             "render": true, // Enable JavaScript rendering for dynamic content
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(90))
@@ -341,7 +528,7 @@ impl SearchEngine {
             response_headers,
             "markdown"
         ).await {
-            log::warn!("Failed to log BrightData request: {}", e);
+            warn!("Failed to log BrightData request: {}", e);
         }
 
         if !response.status().is_success() {
@@ -355,47 +542,19 @@ impl SearchEngine {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(format!("Failed to read SERP response: {}", e)))?;
 
-        // Apply filters conditionally based on environment variable
-        let filtered_content = if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            if ResponseFilter::is_error_page(&raw_content) {
-                return Err(BrightDataError::ToolError("Enhanced search returned error page".into()));
-            } else if ResponseStrategy::should_try_next_source(&raw_content) {
-                return Err(BrightDataError::ToolError("Content quality too low".into()));
-            } else {
-                ResponseFilter::filter_financial_content(&raw_content)
-            }
-        } else {
-            raw_content.clone()
-        };
-
-        // Format the results for better readability
-        let formatted_content = self.format_search_results(&filtered_content, query, page, num_results, search_type);
-
-        Ok(json!({
-            "content": filtered_content,
-            "formatted_content": formatted_content,
-            "query": query,
-            "engine": engine,
-            "page": page,
-            "num_results": num_results,
-            "country": country,
-            "language": language,
-            "search_type": search_type,
-            "safe_search": safe_search,
-            "time_filter": time_filter,
-            "zone": zone,
-            "execution_id": execution_id,
-            "raw_response": raw_content,
-            "success": true,
-            "api_type": "serp_api"
-        }))
+        // ENHANCED: Use the new priority-aware filtering handler
+        self.handle_brightdata_response_with_priority(raw_content, query, engine, priority, token_budget, execution_id).await
     }
 
-    // Original method (preserved for backward compatibility)
-    async fn search_with_brightdata(&self, query: &str, engine: &str, execution_id: &str) -> Result<Value, BrightDataError> {
+    // ENHANCED: Priority-aware legacy search method
+    async fn search_with_brightdata_with_priority(
+        &self, 
+        query: &str, 
+        engine: &str, 
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
+        execution_id: &str
+    ) -> Result<Value, BrightDataError> {
         let api_token = std::env::var("BRIGHTDATA_API_TOKEN")
             .or_else(|_| std::env::var("API_TOKEN"))
             .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
@@ -407,14 +566,24 @@ impl SearchEngine {
         let zone = std::env::var("BRIGHTDATA_SERP_ZONE")
             .unwrap_or_else(|_| "serp_api2".to_string());
 
-        info!("🔍 Search URL: {} using zone: {} (execution: {})", search_url, zone, execution_id);
+        info!("🔍 Priority {} search URL: {} using zone: {} (execution: {})", 
+              format!("{:?}", priority), search_url, zone, execution_id);
 
-        let payload = json!({
+        let mut payload = json!({
             "url": search_url,
             "zone": zone,
             "format": "raw",
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(90))
@@ -447,7 +616,7 @@ impl SearchEngine {
             response_headers,
             "markdown"
         ).await {
-            log::warn!("Failed to log BrightData request: {}", e);
+            warn!("Failed to log BrightData request: {}", e);
         }
 
         if !response.status().is_success() {
@@ -461,30 +630,8 @@ impl SearchEngine {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(format!("Failed to read response: {}", e)))?;
 
-        // Apply filters conditionally
-        let filtered_content = if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            if ResponseFilter::is_error_page(&raw_content) {
-                return Err(BrightDataError::ToolError("Search returned error page".into()));
-            } else {
-                ResponseFilter::filter_financial_content(&raw_content)
-            }
-        } else {
-            raw_content.clone()
-        };
-
-        Ok(json!({
-            "content": filtered_content,
-            "query": query,
-            "engine": engine,
-            "search_url": search_url,
-            "zone": zone,
-            "execution_id": execution_id,
-            "success": true,
-            "api_type": "legacy"
-        }))
+        // ENHANCED: Use the new priority-aware filtering handler for legacy method too
+        self.handle_brightdata_response_with_priority(raw_content, query, engine, priority, token_budget, execution_id).await
     }
 
     fn get_base_search_url(&self, engine: &str) -> String {
@@ -506,7 +653,46 @@ impl SearchEngine {
         }
     }
 
+    // ENHANCED: Priority-aware result formatting
+    fn format_search_results_with_priority(
+        &self, 
+        content: &str, 
+        query: &str, 
+        page: u32, 
+        num_results: u32, 
+        search_type: &str, 
+        priority: crate::filters::strategy::QueryPriority
+    ) -> String {
+        // Check if we need compact formatting
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            // Ultra-compact formatting for filtered mode
+            return format!("🔍 {}: {}", 
+                ResponseStrategy::ultra_abbreviate_query(query), 
+                content
+            );
+        }
+
+        // Regular formatting for non-filtered mode
+        self.format_search_results(content, query, page, num_results, search_type)
+    }
+
     fn format_search_results(&self, content: &str, query: &str, page: u32, num_results: u32, search_type: &str) -> String {
+        // Check for compact formatting first
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            // Ultra-compact formatting for filtered mode
+            return format!("🔍 {}: {}", 
+                ResponseStrategy::ultra_abbreviate_query(query), 
+                content
+            );
+        }
+
+        // Original formatting for non-filtered mode
         let mut formatted = String::new();
         
         // Add header with search parameters

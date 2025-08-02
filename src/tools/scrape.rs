@@ -1,4 +1,4 @@
-// src/tools/scrape.rs - Supports multiple BrightData credential types with optional filtering
+// src/tools/scrape.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -135,6 +135,10 @@ impl Tool for ScrapeMarkdown {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(url);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(url);
+
         // Early validation using strategy only if TRUNCATE_FILTER is enabled
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
@@ -144,33 +148,39 @@ impl Tool for ScrapeMarkdown {
             if matches!(response_type, ResponseType::Empty) {
                 return Ok(ResponseStrategy::create_response("", url, "scrape", "validation", json!({}), response_type));
             }
+
+            // Budget check for scrape queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 150 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", url, "scrape", "budget_limit", json!({}), ResponseType::Skip));
+            }
         }
 
         let execution_id = self.generate_execution_id();
         
-        // Auto-detect best available method
+        // Auto-detect best available method with priority awareness
         let selected_method = if method == "auto" {
-            self.detect_best_method()
+            self.detect_best_method_with_priority(query_priority)
         } else {
             method.to_string()
         };
 
         let result = match selected_method.as_str() {
             "api" => {
-                self.scrape_with_api_interface(
+                self.scrape_with_api_interface_priority(
                     url, format, country, mobile, wait_for, &custom_headers,
-                    disable_captcha_solving, &execution_id
+                    disable_captcha_solving, query_priority, recommended_tokens, &execution_id
                 ).await?
             }
             "web_unlocker_proxy" => {
-                self.scrape_with_web_unlocker_proxy(
+                self.scrape_with_web_unlocker_proxy_priority(
                     url, format, country, city, zipcode, mobile, wait_for, &custom_headers,
-                    disable_captcha_solving, &execution_id
+                    disable_captcha_solving, query_priority, recommended_tokens, &execution_id
                 ).await?
             }
             "residential_proxy" => {
-                self.scrape_with_residential_proxy(
-                    url, country, mobile, &custom_headers, &execution_id
+                self.scrape_with_residential_proxy_priority(
+                    url, country, mobile, &custom_headers, query_priority, recommended_tokens, &execution_id
                 ).await?
             }
             _ => {
@@ -198,12 +208,14 @@ impl Tool for ScrapeMarkdown {
             };
 
             let mcp_content = vec![McpContent::text(format!(
-                "🌐 **BrightData Scrape from {}**\n\nMethod: {} | Format: {} | Country: {} | Mobile: {}\nZone/Service: {} | Execution ID: {}\n\n{}",
+                "🌐 **BrightData Scrape from {}**\n\nMethod: {} | Format: {} | Country: {} | Mobile: {} | Priority: {:?} | Tokens: {}\nZone/Service: {} | Execution ID: {}\n\n{}",
                 url,
                 selected_method.to_uppercase(),
                 format,
                 if country.is_empty() { "Auto" } else { country },
                 mobile,
+                query_priority,
+                recommended_tokens,
                 service_used,
                 execution_id,
                 content_text
@@ -227,8 +239,20 @@ impl ScrapeMarkdown {
         format!("scrape_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"))
     }
 
-    fn detect_best_method(&self) -> String {
-        // Priority: Web Unlocker API > Web Unlocker Proxy > Residential Proxy
+    // ENHANCED: Priority-aware method detection
+    fn detect_best_method_with_priority(&self, priority: crate::filters::strategy::QueryPriority) -> String {
+        // For critical queries, prefer best available methods
+        match priority {
+            crate::filters::strategy::QueryPriority::Critical => {
+                // Priority: Web Unlocker API > Web Unlocker Proxy > Residential Proxy
+                if std::env::var("BRIGHTDATA_API_TOKEN").is_ok() || std::env::var("API_TOKEN").is_ok() {
+                    return "api".to_string();
+                }
+            }
+            _ => {
+                // For lower priority, use simpler methods first
+            }
+        }
         
         if std::env::var("BRIGHTDATA_API_TOKEN").is_ok() || std::env::var("API_TOKEN").is_ok() {
             return "api".to_string();
@@ -248,8 +272,8 @@ impl ScrapeMarkdown {
         "api".to_string()
     }
 
-    // Web Unlocker API Interface
-    async fn scrape_with_api_interface(
+    // ENHANCED: Priority-aware Web Unlocker API Interface
+    async fn scrape_with_api_interface_priority(
         &self, 
         url: &str, 
         format: &str,
@@ -258,6 +282,8 @@ impl ScrapeMarkdown {
         wait_for: &str,
         custom_headers: &serde_json::Map<String, Value>,
         disable_captcha_solving: bool,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str
     ) -> Result<Value, BrightDataError> {
         let api_token = std::env::var("BRIGHTDATA_API_TOKEN")
@@ -270,7 +296,8 @@ impl ScrapeMarkdown {
         let zone = std::env::var("WEB_UNLOCKER_ZONE")
             .unwrap_or_else(|_| "default".to_string());
 
-        info!("🌐 API Interface: Web Unlocker scraping {} using zone: {} (execution: {})", url, zone, execution_id);
+        info!("🌐 Priority {} API Interface: Web Unlocker scraping {} using zone: {} (execution: {})", 
+              format!("{:?}", priority), url, zone, execution_id);
 
         let mut payload = json!({
             "zone": zone,
@@ -301,6 +328,15 @@ impl ScrapeMarkdown {
             payload["headers"] = json!(custom_headers);
         }
 
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
+
         let client = Client::builder().timeout(Duration::from_secs(120)).build()
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
@@ -313,11 +349,11 @@ impl ScrapeMarkdown {
             .await
             .map_err(|e| BrightDataError::ToolError(format!("API request failed: {}", e)))?;
 
-        self.handle_response(response, execution_id, &zone, url, format, payload, "Web Unlocker API").await
+        self.handle_response_with_priority(response, execution_id, &zone, url, format, payload, "Web Unlocker API", priority, token_budget).await
     }
 
-    // Web Unlocker Proxy Interface
-    async fn scrape_with_web_unlocker_proxy(
+    // ENHANCED: Priority-aware Web Unlocker Proxy Interface
+    async fn scrape_with_web_unlocker_proxy_priority(
         &self, 
         url: &str, 
         format: &str,
@@ -328,6 +364,8 @@ impl ScrapeMarkdown {
         wait_for: &str,
         custom_headers: &serde_json::Map<String, Value>,
         disable_captcha_solving: bool,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str
     ) -> Result<Value, BrightDataError> {
         let customer_id = std::env::var("BRIGHTDATA_CUSTOMER_ID")
@@ -341,7 +379,8 @@ impl ScrapeMarkdown {
             .or_else(|_| std::env::var("ZONE_PASSWORD"))
             .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_ZONE_PASSWORD for Web Unlocker proxy".into()))?;
 
-        info!("🌐 Web Unlocker Proxy: scraping {} using zone: {} (execution: {})", url, zone, execution_id);
+        info!("🌐 Priority {} Web Unlocker Proxy: scraping {} using zone: {} (execution: {})", 
+              format!("{:?}", priority), url, zone, execution_id);
 
         let proxy_username = format!("brd-customer-{}-zone-{}", customer_id, zone);
         let proxy_url = format!("http://{}:{}@brd.superproxy.io:33335", proxy_username, password);
@@ -361,6 +400,9 @@ impl ScrapeMarkdown {
         if !zipcode.is_empty() { headers.insert("x-unblock-zipcode", zipcode.parse().unwrap()); }
         if mobile { headers.insert("x-unblock-mobile", "true".parse().unwrap()); }
         if disable_captcha_solving { headers.insert("x-unblock-disable-captcha", "true".parse().unwrap()); }
+
+        // Add priority header
+        headers.insert("x-unblock-priority", format!("{:?}", priority).parse().unwrap());
 
         if !wait_for.is_empty() {
             let expect_value = if wait_for.starts_with('.') || wait_for.starts_with('#') {
@@ -400,19 +442,23 @@ impl ScrapeMarkdown {
             "format": format,
             "country": country,
             "city": city,
-            "zipcode": zipcode
+            "zipcode": zipcode,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget
         });
 
-        self.handle_response(response, execution_id, &zone, url, format, payload, "Web Unlocker Proxy").await
+        self.handle_response_with_priority(response, execution_id, &zone, url, format, payload, "Web Unlocker Proxy", priority, token_budget).await
     }
 
-    // Residential/Datacenter Proxy Interface (your existing credentials)
-    async fn scrape_with_residential_proxy(
+    // ENHANCED: Priority-aware Residential/Datacenter Proxy Interface
+    async fn scrape_with_residential_proxy_priority(
         &self, 
         url: &str, 
         country: &str,
         mobile: bool,
         custom_headers: &serde_json::Map<String, Value>,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str
     ) -> Result<Value, BrightDataError> {
         let proxy_username = std::env::var("BRIGHTDATA_PROXY_USERNAME")
@@ -427,15 +473,20 @@ impl ScrapeMarkdown {
         let proxy_port = std::env::var("BRIGHTDATA_PROXY_PORT")
             .unwrap_or_else(|_| "22225".to_string());
 
-        info!("🌐 Residential Proxy: scraping {} via {}:{} (execution: {})", url, proxy_host, proxy_port, execution_id);
+        info!("🌐 Priority {} Residential Proxy: scraping {} via {}:{} (execution: {})", 
+              format!("{:?}", priority), url, proxy_host, proxy_port, execution_id);
 
-        // Build enhanced username with targeting
+        // Build enhanced username with targeting and priority
         let mut enhanced_username = proxy_username.clone();
         if !country.is_empty() {
             enhanced_username = format!("{}-country-{}", enhanced_username, country);
         }
         if mobile {
             enhanced_username = format!("{}-session-mobile", enhanced_username);
+        }
+        // Add priority session info for critical queries
+        if matches!(priority, crate::filters::strategy::QueryPriority::Critical) {
+            enhanced_username = format!("{}-session-critical", enhanced_username);
         }
 
         let proxy_url = format!("http://{}:{}@{}:{}", enhanced_username, proxy_password, proxy_host, proxy_port);
@@ -456,9 +507,11 @@ impl ScrapeMarkdown {
             }
         }
 
-        // Set appropriate user agent
+        // Set appropriate user agent based on priority
         if mobile {
             headers.insert("user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 14_7_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Mobile/15E148 Safari/604.1".parse().unwrap());
+        } else if matches!(priority, crate::filters::strategy::QueryPriority::Critical) {
+            headers.insert("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap());
         }
 
         let client = Client::builder()
@@ -477,13 +530,16 @@ impl ScrapeMarkdown {
             "proxy_host": proxy_host,
             "proxy_port": proxy_port,
             "country": country,
-            "mobile": mobile
+            "mobile": mobile,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget
         });
 
-        self.handle_response(response, execution_id, "residential_proxy", url, "raw", payload, "Residential Proxy").await
+        self.handle_response_with_priority(response, execution_id, "residential_proxy", url, "raw", payload, "Residential Proxy", priority, token_budget).await
     }
 
-    async fn handle_response(
+    // ENHANCED: Priority-aware response handling with token management
+    async fn handle_response_with_priority(
         &self,
         response: reqwest::Response,
         execution_id: &str,
@@ -491,7 +547,9 @@ impl ScrapeMarkdown {
         url: &str,
         format: &str,
         payload: Value,
-        service_type: &str
+        service_type: &str,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
     ) -> Result<Value, BrightDataError> {
         let status = response.status().as_u16();
         let response_headers: HashMap<String, String> = response
@@ -524,7 +582,7 @@ impl ScrapeMarkdown {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters conditionally based on environment variable
+        // Apply filters conditionally based on environment variable with priority awareness
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
@@ -536,19 +594,22 @@ impl ScrapeMarkdown {
             }
         }
 
-        let processed_content = self.post_process_content(&raw_content, format);
+        let processed_content = self.post_process_content_with_priority(&raw_content, format, priority, token_budget);
 
         Ok(json!({
             "content": processed_content,
             "raw_content": raw_content,
             "service": service_type,
             "service_name": service_name,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget,
             "execution_id": execution_id,
             "success": true
         }))
     }
 
-    fn post_process_content(&self, content: &str, format: &str) -> String {
+    // ENHANCED: Priority-aware post-processing
+    fn post_process_content_with_priority(&self, content: &str, format: &str, priority: crate::filters::strategy::QueryPriority, token_budget: usize) -> String {
         let mut processed = match format {
             "screenshot" => {
                 format!("Screenshot captured successfully. Base64 data length: {} characters", content.len())
@@ -557,11 +618,26 @@ impl ScrapeMarkdown {
             _ => content.to_string()
         };
 
-        // Apply filters conditionally
+        // Apply filters conditionally with priority awareness
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) && format != "screenshot" {
-            processed = ResponseFilter::filter_financial_content(&processed);
+            
+            // Use token budget aware filtering
+            let max_tokens = token_budget / 2; // Reserve tokens for formatting
+            processed = ResponseFilter::extract_high_value_financial_data(&processed, max_tokens);
+            
+            // Apply priority-specific truncation
+            let max_length = match priority {
+                crate::filters::strategy::QueryPriority::Critical => 20000,
+                crate::filters::strategy::QueryPriority::High => 15000,
+                crate::filters::strategy::QueryPriority::Medium => 10000,
+                crate::filters::strategy::QueryPriority::Low => 5000,
+            };
+            
+            if processed.len() > max_length {
+                processed = ResponseFilter::smart_truncate_preserving_financial_data(&processed, max_length);
+            }
         }
 
         processed

@@ -1,4 +1,4 @@
-// src/tools/commodity.rs - Enhanced with market-specific sources and real-time data
+// src/tools/commodity.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -117,38 +117,78 @@ impl Tool for CommodityDataTool {
             .and_then(|v| v.as_str())
             .unwrap_or("USD");
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
         // Early validation using strategy
-        let response_type = ResponseStrategy::determine_response_type("", query);
-        if matches!(response_type, ResponseType::Empty) {
-            return Ok(ResponseStrategy::create_response("", query, market_region, "validation", json!({}), response_type));
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, market_region, "validation", json!({}), response_type));
+            }
+
+            // Budget check for commodity queries
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, market_region, "budget_limit", json!({}), ResponseType::Skip));
+            }
         }
 
         let execution_id = format!("commodity_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
         
-        match self.fetch_commodity_data_with_fallbacks(
+        match self.fetch_commodity_data_with_fallbacks_and_priority(
             query, commodity_type, market_region, data_source, time_range,
-            include_futures, include_analysis, currency, &execution_id
+            include_futures, include_analysis, currency, query_priority, recommended_tokens, &execution_id
         ).await {
             Ok(result) => {
                 let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let source_used = result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Unknown");
                 
-                // Create appropriate response
-                let tool_result = ResponseStrategy::create_financial_response(
-                    "commodity", query, market_region, source_used, content, result.clone()
-                );
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "commodity", query, market_region, source_used, content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "🥇 **Commodity Data for: {}**\n\nType: {} | Region: {} | Priority: {:?} | Tokens: {}\nSource: {} | Time Range: {} | Currency: {} | Futures: {} | Analysis: {}\nExecution ID: {}\n\n{}",
+                        query, commodity_type, market_region, query_priority, recommended_tokens, source_used, time_range, currency, include_futures, include_analysis, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
                 
-                Ok(ResponseStrategy::apply_size_limits(tool_result))
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
             }
             Err(e) => {
-                Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
             }
         }
     }
 }
 
 impl CommodityDataTool {
-    async fn fetch_commodity_data_with_fallbacks(
+    // ENHANCED: Priority-aware commodity data fetching with token management
+    async fn fetch_commodity_data_with_fallbacks_and_priority(
         &self,
         query: &str,
         commodity_type: &str,
@@ -158,44 +198,68 @@ impl CommodityDataTool {
         include_futures: bool,
         include_analysis: bool,
         currency: &str,
+        query_priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str,
     ) -> Result<Value, BrightDataError> {
-        let sources_to_try = self.build_prioritized_sources(query, commodity_type, market_region, data_source);
+        let sources_to_try = self.build_prioritized_sources_with_priority(query, commodity_type, market_region, data_source, query_priority);
         let mut last_error = None;
 
         for (sequence, (source_type, url_or_query, source_name)) in sources_to_try.iter().enumerate() {
             match source_type.as_str() {
                 "direct" => {
-                    match self.fetch_direct_commodity_data(
+                    match self.fetch_direct_commodity_data_with_priority(
                         url_or_query, query, commodity_type, market_region, 
-                        source_name, execution_id, sequence as u64
+                        source_name, query_priority, token_budget, execution_id, sequence as u64
                     ).await {
                         Ok(mut result) => {
                             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                             
-                            if !ResponseStrategy::should_try_next_source(content) {
-                                result["source_used"] = json!(source_name);
-                                result["data_source_type"] = json!("direct");
-                                return Ok(result);
+                            if std::env::var("TRUNCATE_FILTER")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false) {
+                                
+                                if ResponseStrategy::should_try_next_source(content) {
+                                    last_error = Some(BrightDataError::ToolError(format!(
+                                        "{} returned low-quality content", source_name
+                                    )));
+                                    continue;
+                                }
                             }
+                            
+                            result["source_used"] = json!(source_name);
+                            result["data_source_type"] = json!("direct");
+                            result["priority"] = json!(format!("{:?}", query_priority));
+                            return Ok(result);
                         }
                         Err(e) => last_error = Some(e),
                     }
                 }
                 "search" => {
-                    match self.fetch_search_commodity_data(
+                    match self.fetch_search_commodity_data_with_priority(
                         url_or_query, commodity_type, market_region, time_range,
                         include_futures, include_analysis, currency, source_name, 
-                        execution_id, sequence as u64
+                        query_priority, token_budget, execution_id, sequence as u64
                     ).await {
                         Ok(mut result) => {
                             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                             
-                            if !ResponseStrategy::should_try_next_source(content) {
-                                result["source_used"] = json!(source_name);
-                                result["data_source_type"] = json!("search");
-                                return Ok(result);
+                            if std::env::var("TRUNCATE_FILTER")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false) {
+                                
+                                if ResponseStrategy::should_try_next_source(content) {
+                                    last_error = Some(BrightDataError::ToolError(format!(
+                                        "{} returned low-quality content", source_name
+                                    )));
+                                    continue;
+                                }
                             }
+                            
+                            result["source_used"] = json!(source_name);
+                            result["data_source_type"] = json!("search");
+                            result["priority"] = json!(format!("{:?}", query_priority));
+                            return Ok(result);
                         }
                         Err(e) => last_error = Some(e),
                     }
@@ -207,84 +271,114 @@ impl CommodityDataTool {
         Err(last_error.unwrap_or_else(|| BrightDataError::ToolError("All commodity data sources failed".into())))
     }
 
-    fn build_prioritized_sources(&self, query: &str, commodity_type: &str, market_region: &str, data_source: &str) -> Vec<(String, String, String)> {
+    // ENHANCED: Priority-aware source building
+    fn build_prioritized_sources_with_priority(&self, query: &str, commodity_type: &str, market_region: &str, data_source: &str, priority: crate::filters::strategy::QueryPriority) -> Vec<(String, String, String)> {
         let mut sources = Vec::new();
         let query_lower = query.to_lowercase();
 
         match data_source {
             "direct" => {
-                sources.extend(self.get_direct_sources(commodity_type, market_region));
+                sources.extend(self.get_direct_sources_with_priority(commodity_type, market_region, priority));
             }
             "search" => {
-                sources.extend(self.get_search_sources(query, commodity_type, market_region));
+                sources.extend(self.get_search_sources_with_priority(query, commodity_type, market_region, priority));
             }
             "auto" | _ => {
-                // Smart selection based on query content
-                if query_lower.contains("price") || query_lower.contains("futures") || query_lower.contains("contract") {
-                    // For price-specific queries, prioritize direct sources
-                    sources.extend(self.get_direct_sources(commodity_type, market_region));
-                    sources.extend(self.get_search_sources(query, commodity_type, market_region));
-                } else {
-                    // For general commodity queries, prioritize search for broader context
-                    sources.extend(self.get_search_sources(query, commodity_type, market_region));
-                    sources.extend(self.get_direct_sources(commodity_type, market_region));
+                // Priority-aware smart selection
+                match priority {
+                    crate::filters::strategy::QueryPriority::Critical => {
+                        // For critical queries, prioritize direct sources for real-time data
+                        sources.extend(self.get_direct_sources_with_priority(commodity_type, market_region, priority));
+                        sources.extend(self.get_search_sources_with_priority(query, commodity_type, market_region, priority));
+                    }
+                    _ => {
+                        // Smart selection based on query content
+                        if query_lower.contains("price") || query_lower.contains("futures") || query_lower.contains("contract") {
+                            sources.extend(self.get_direct_sources_with_priority(commodity_type, market_region, priority));
+                            sources.extend(self.get_search_sources_with_priority(query, commodity_type, market_region, priority));
+                        } else {
+                            sources.extend(self.get_search_sources_with_priority(query, commodity_type, market_region, priority));
+                            sources.extend(self.get_direct_sources_with_priority(commodity_type, market_region, priority));
+                        }
+                    }
                 }
             }
         }
 
+        // Limit sources based on priority to save tokens
+        let max_sources = match priority {
+            crate::filters::strategy::QueryPriority::Critical => sources.len(), // No limit for critical
+            crate::filters::strategy::QueryPriority::High => std::cmp::min(sources.len(), 3),
+            crate::filters::strategy::QueryPriority::Medium => std::cmp::min(sources.len(), 2),
+            crate::filters::strategy::QueryPriority::Low => std::cmp::min(sources.len(), 1),
+        };
+
+        sources.truncate(max_sources);
         sources
     }
 
-    fn get_direct_sources(&self, commodity_type: &str, market_region: &str) -> Vec<(String, String, String)> {
+    fn get_direct_sources_with_priority(&self, commodity_type: &str, market_region: &str, priority: crate::filters::strategy::QueryPriority) -> Vec<(String, String, String)> {
         let mut sources = Vec::new();
 
         match market_region {
             "india" => {
                 sources.push(("direct".to_string(), "https://www.mcxindia.com/market-data/live-rates".to_string(), "MCX India".to_string()));
-                sources.push(("direct".to_string(), "https://www.ncdex.com/market/live-rates".to_string(), "NCDEX".to_string()));
+                if matches!(priority, crate::filters::strategy::QueryPriority::Critical | crate::filters::strategy::QueryPriority::High) {
+                    sources.push(("direct".to_string(), "https://www.ncdex.com/market/live-rates".to_string(), "NCDEX".to_string()));
+                }
                 if commodity_type == "precious_metals" || commodity_type == "all" {
                     sources.push(("direct".to_string(), "https://www.goldpriceindia.com/".to_string(), "Gold Price India".to_string()));
                 }
             }
             "us" => {
                 sources.push(("direct".to_string(), "https://www.cmegroup.com/markets.html".to_string(), "CME Group".to_string()));
-                sources.push(("direct".to_string(), "https://www.theice.com/market-data".to_string(), "ICE Markets".to_string()));
+                if matches!(priority, crate::filters::strategy::QueryPriority::Critical | crate::filters::strategy::QueryPriority::High) {
+                    sources.push(("direct".to_string(), "https://www.theice.com/market-data".to_string(), "ICE Markets".to_string()));
+                }
                 if commodity_type == "energy" || commodity_type == "all" {
                     sources.push(("direct".to_string(), "https://www.eia.gov/petroleum/".to_string(), "EIA Energy".to_string()));
                 }
             }
             "europe" => {
                 sources.push(("direct".to_string(), "https://www.theice.com/market-data/dashboard".to_string(), "ICE Europe".to_string()));
-                sources.push(("direct".to_string(), "https://www.lme.com/Metals".to_string(), "London Metal Exchange".to_string()));
+                if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
+                    sources.push(("direct".to_string(), "https://www.lme.com/Metals".to_string(), "London Metal Exchange".to_string()));
+                }
             }
             "asia" => {
                 sources.push(("direct".to_string(), "https://www.tocom.or.jp/market/".to_string(), "TOCOM".to_string()));
-                sources.push(("direct".to_string(), "https://www.shfe.com.cn/en/".to_string(), "Shanghai Futures".to_string()));
+                if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
+                    sources.push(("direct".to_string(), "https://www.shfe.com.cn/en/".to_string(), "Shanghai Futures".to_string()));
+                }
             }
             "global" | _ => {
-                // Global commodity sources
+                // Global commodity sources with priority filtering
                 sources.push(("direct".to_string(), "https://www.investing.com/commodities/".to_string(), "Investing.com Commodities".to_string()));
-                sources.push(("direct".to_string(), "https://www.bloomberg.com/markets/commodities".to_string(), "Bloomberg Commodities".to_string()));
-                sources.push(("direct".to_string(), "https://www.marketwatch.com/investing/commodities".to_string(), "MarketWatch Commodities".to_string()));
+                if matches!(priority, crate::filters::strategy::QueryPriority::Critical | crate::filters::strategy::QueryPriority::High) {
+                    sources.push(("direct".to_string(), "https://www.bloomberg.com/markets/commodities".to_string(), "Bloomberg Commodities".to_string()));
+                    sources.push(("direct".to_string(), "https://www.marketwatch.com/investing/commodities".to_string(), "MarketWatch Commodities".to_string()));
+                }
                 
-                // Commodity-specific sources
-                match commodity_type {
-                    "precious_metals" => {
-                        sources.push(("direct".to_string(), "https://www.kitco.com/market/".to_string(), "Kitco Metals".to_string()));
-                        sources.push(("direct".to_string(), "https://www.lbma.org.uk/prices-and-data".to_string(), "LBMA".to_string()));
+                // Commodity-specific sources (only for higher priority)
+                if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
+                    match commodity_type {
+                        "precious_metals" => {
+                            sources.push(("direct".to_string(), "https://www.kitco.com/market/".to_string(), "Kitco Metals".to_string()));
+                            sources.push(("direct".to_string(), "https://www.lbma.org.uk/prices-and-data".to_string(), "LBMA".to_string()));
+                        }
+                        "energy" => {
+                            sources.push(("direct".to_string(), "https://oilprice.com/".to_string(), "Oil Price".to_string()));
+                            sources.push(("direct".to_string(), "https://www.eia.gov/petroleum/".to_string(), "EIA".to_string()));
+                        }
+                        "agricultural" => {
+                            sources.push(("direct".to_string(), "https://www.cbot.com/".to_string(), "CBOT".to_string()));
+                            sources.push(("direct".to_string(), "https://www.usda.gov/topics/data".to_string(), "USDA".to_string()));
+                        }
+                        "industrial_metals" => {
+                            sources.push(("direct".to_string(), "https://www.lme.com/Metals".to_string(), "LME".to_string()));
+                        }
+                        _ => {}
                     }
-                    "energy" => {
-                        sources.push(("direct".to_string(), "https://oilprice.com/".to_string(), "Oil Price".to_string()));
-                        sources.push(("direct".to_string(), "https://www.eia.gov/petroleum/".to_string(), "EIA".to_string()));
-                    }
-                    "agricultural" => {
-                        sources.push(("direct".to_string(), "https://www.cbot.com/".to_string(), "CBOT".to_string()));
-                        sources.push(("direct".to_string(), "https://www.usda.gov/topics/data".to_string(), "USDA".to_string()));
-                    }
-                    "industrial_metals" => {
-                        sources.push(("direct".to_string(), "https://www.lme.com/Metals".to_string(), "LME".to_string()));
-                    }
-                    _ => {}
                 }
             }
         }
@@ -292,7 +386,7 @@ impl CommodityDataTool {
         sources
     }
 
-    fn get_search_sources(&self, query: &str, commodity_type: &str, market_region: &str) -> Vec<(String, String, String)> {
+    fn get_search_sources_with_priority(&self, query: &str, commodity_type: &str, market_region: &str, priority: crate::filters::strategy::QueryPriority) -> Vec<(String, String, String)> {
         let mut sources = Vec::new();
         
         let region_terms = match market_region {
@@ -313,29 +407,41 @@ impl CommodityDataTool {
             _ => "commodity futures spot price market trading"
         };
 
-        // Enhanced search queries
-        sources.push(("search".to_string(), 
-            format!("{} {} {} current price futures today", query, region_terms, commodity_terms),
-            "Enhanced Commodity Search".to_string()));
-
-        sources.push(("search".to_string(), 
-            format!("{} {} latest trading data market analysis", query, commodity_terms),
-            "Commodity Market Analysis".to_string()));
-
-        sources.push(("search".to_string(), 
-            format!("{} {} price chart trends technical analysis", query, region_terms),
-            "Commodity Trends Search".to_string()));
+        // Priority-based search query construction
+        match priority {
+            crate::filters::strategy::QueryPriority::Critical => {
+                sources.push(("search".to_string(), 
+                    format!("{} {} live current real-time price", query, region_terms),
+                    "Critical Commodity Search".to_string()));
+            }
+            crate::filters::strategy::QueryPriority::High => {
+                sources.push(("search".to_string(), 
+                    format!("{} {} {} current price futures today", query, region_terms, commodity_terms),
+                    "High Priority Commodity Search".to_string()));
+                sources.push(("search".to_string(), 
+                    format!("{} {} latest trading data market analysis", query, commodity_terms),
+                    "Commodity Market Analysis".to_string()));
+            }
+            _ => {
+                sources.push(("search".to_string(), 
+                    format!("{} {} price chart trends technical analysis", query, region_terms),
+                    "Commodity Trends Search".to_string()));
+            }
+        }
 
         sources
     }
 
-    async fn fetch_direct_commodity_data(
+    // ENHANCED: Priority-aware direct commodity data fetching
+    async fn fetch_direct_commodity_data_with_priority(
         &self,
         url: &str,
         query: &str,
         commodity_type: &str,
         market_region: &str,
         source_name: &str,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str,
         sequence: u64,
     ) -> Result<Value, BrightDataError> {
@@ -349,15 +455,25 @@ impl CommodityDataTool {
         let zone = env::var("WEB_UNLOCKER_ZONE")
             .unwrap_or_else(|_| "default".to_string());
 
-        info!("🥇 Direct commodity data fetch from {} using zone: {} (execution: {})", source_name, zone, execution_id);
+        info!("🥇 Priority {} direct commodity data fetch from {} using zone: {} (execution: {})", 
+              format!("{:?}", priority), source_name, zone, execution_id);
 
-        let payload = json!({
+        let mut payload = json!({
             "url": url,
             "zone": zone,
             "format": "raw",
             "data_format": "markdown",
-            "render": true // Enable JavaScript rendering for dynamic content
+            "render": true
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -404,11 +520,19 @@ impl CommodityDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters
-        let filtered_content = if ResponseFilter::is_error_page(&raw_content) {
-            return Err(BrightDataError::ToolError(format!("{} returned error page", source_name)));
+        // Apply priority-aware filters
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError(format!("{} returned error page", source_name)));
+            } else {
+                let max_tokens = token_budget / 2; // Reserve tokens for formatting
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
+            }
         } else {
-            ResponseFilter::filter_financial_content(&raw_content)
+            raw_content.clone()
         };
 
         Ok(json!({
@@ -416,13 +540,16 @@ impl CommodityDataTool {
             "query": query,
             "commodity_type": commodity_type,
             "market_region": market_region,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget,
             "execution_id": execution_id,
             "sequence": sequence,
             "success": true
         }))
     }
 
-    async fn fetch_search_commodity_data(
+    // ENHANCED: Priority-aware search commodity data fetching
+    async fn fetch_search_commodity_data_with_priority(
         &self,
         search_query: &str,
         commodity_type: &str,
@@ -432,6 +559,8 @@ impl CommodityDataTool {
         include_analysis: bool,
         currency: &str,
         source_name: &str,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str,
         sequence: u64,
     ) -> Result<Value, BrightDataError> {
@@ -445,34 +574,56 @@ impl CommodityDataTool {
         let zone = env::var("BRIGHTDATA_SERP_ZONE")
             .unwrap_or_else(|_| "serp_api2".to_string());
 
-        // Build enhanced search query
+        // Build enhanced search query with priority awareness
         let mut enhanced_query = search_query.to_string();
         
-        if include_futures {
-            enhanced_query.push_str(" futures contract trading");
-        }
-        
-        if include_analysis {
-            enhanced_query.push_str(" market analysis trends forecast");
+        // Add terms based on priority
+        match priority {
+            crate::filters::strategy::QueryPriority::Critical => {
+                enhanced_query.push_str(" live current real time");
+            }
+            crate::filters::strategy::QueryPriority::High => {
+                if include_futures {
+                    enhanced_query.push_str(" futures contract trading");
+                }
+                if include_analysis {
+                    enhanced_query.push_str(" market analysis trends forecast");
+                }
+            }
+            _ => {
+                // Basic terms for lower priority
+                enhanced_query.push_str(" overview");
+            }
         }
 
-        if currency != "USD" {
+        if currency != "USD" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
             enhanced_query.push_str(&format!(" price {}", currency));
         }
 
-        match time_range {
-            "realtime" => enhanced_query.push_str(" live current real time"),
-            "day" => enhanced_query.push_str(" today daily"),
-            "week" => enhanced_query.push_str(" this week weekly"),
-            "month" => enhanced_query.push_str(" this month monthly"),
-            "year" => enhanced_query.push_str(" this year annual"),
-            _ => {}
+        // Add time range only for higher priority
+        if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
+            match time_range {
+                "realtime" => enhanced_query.push_str(" live current real time"),
+                "day" => enhanced_query.push_str(" today daily"),
+                "week" => enhanced_query.push_str(" this week weekly"),
+                "month" => enhanced_query.push_str(" this month monthly"),
+                "year" => enhanced_query.push_str(" this year annual"),
+                _ => {}
+            }
         }
 
-        // Build SERP API query parameters
+        // Build SERP API query parameters with priority-based limits
         let mut query_params = HashMap::new();
         query_params.insert("q".to_string(), enhanced_query.clone());
-        query_params.insert("num".to_string(), "20".to_string()); // More results for better data
+        
+        // Adjust results based on priority
+        let num_results = match priority {
+            crate::filters::strategy::QueryPriority::Critical => "20",
+            crate::filters::strategy::QueryPriority::High => "15",
+            crate::filters::strategy::QueryPriority::Medium => "10",
+            crate::filters::strategy::QueryPriority::Low => "5",
+        };
+        query_params.insert("num".to_string(), num_results.to_string());
         
         // Set geographic location based on market region
         let country_code = match market_region {
@@ -485,8 +636,8 @@ impl CommodityDataTool {
         query_params.insert("gl".to_string(), country_code.to_string());
         query_params.insert("hl".to_string(), "en".to_string());
         
-        // Time-based filtering for recent data
-        if time_range != "year" {
+        // Time-based filtering for recent data (skip for low priority)
+        if time_range != "year" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
             let tbs_value = match time_range {
                 "realtime" | "day" => "qdr:d",
                 "week" => "qdr:w",
@@ -498,9 +649,10 @@ impl CommodityDataTool {
             }
         }
 
-        info!("🔍 Enhanced commodity search: {} using zone: {} (execution: {})", enhanced_query.clone(), zone.clone(), execution_id.clone());
+        info!("🔍 Priority {} enhanced commodity search: {} using zone: {} (execution: {})", 
+              format!("{:?}", priority), enhanced_query.clone(), zone.clone(), execution_id.clone());
 
-        let payload = json!({
+        let mut payload = json!({
             "zone": zone,
             "url": "https://www.google.com/search",
             "format": "json",
@@ -508,6 +660,15 @@ impl CommodityDataTool {
             "render": true,
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -554,11 +715,19 @@ impl CommodityDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters
-        let filtered_content = if ResponseFilter::is_error_page(&raw_content) {
-            return Err(BrightDataError::ToolError(format!("{} search returned error page", source_name)));
+        // Apply priority-aware filters
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError(format!("{} search returned error page", source_name)));
+            } else {
+                let max_tokens = token_budget / 3; // Reserve tokens for formatting
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
+            }
         } else {
-            ResponseFilter::filter_financial_content(&raw_content)
+            raw_content.clone()
         };
 
         Ok(json!({
@@ -568,6 +737,8 @@ impl CommodityDataTool {
             "market_region": market_region,
             "time_range": time_range,
             "currency": currency,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget,
             "execution_id": execution_id,
             "sequence": sequence,
             "success": true

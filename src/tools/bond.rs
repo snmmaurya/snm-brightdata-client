@@ -1,4 +1,4 @@
-// src/tools/bond.rs - Enhanced with optional filtering via TRUNCATE_FILTER env var
+// src/tools/bond.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -117,6 +117,10 @@ impl Tool for BondDataTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // ENHANCED: Priority classification and token allocation
+        let query_priority = ResponseStrategy::classify_query_priority(query);
+        let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
+
         // Early validation using strategy only if TRUNCATE_FILTER is enabled
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
@@ -126,13 +130,19 @@ impl Tool for BondDataTool {
             if matches!(response_type, ResponseType::Empty) {
                 return Ok(ResponseStrategy::create_response("", query, market, "validation", json!({}), response_type));
             }
+
+            // Budget check for bond queries  
+            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
+            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, market, "budget_limit", json!({}), ResponseType::Skip));
+            }
         }
 
         let execution_id = format!("bond_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
         
-        match self.fetch_bond_data_with_fallbacks(
+        match self.fetch_bond_data_with_fallbacks_and_priority(
             query, market, bond_type, maturity, data_source, time_filter,
-            include_rates, include_analysis, &execution_id
+            include_rates, include_analysis, query_priority, recommended_tokens, &execution_id
         ).await {
             Ok(result) => {
                 let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -149,8 +159,8 @@ impl Tool for BondDataTool {
                 } else {
                     // No filtering - create standard response
                     let mcp_content = vec![McpContent::text(format!(
-                        "🏛️ **Bond Data for: {}**\n\nMarket: {} | Bond Type: {} | Maturity: {}\nSource: {} | Time Filter: {}\n\n{}",
-                        query, market, bond_type, maturity, source_used, time_filter, content
+                        "🏛️ **Bond Data for: {}**\n\nMarket: {} | Bond Type: {} | Maturity: {} | Priority: {:?} | Tokens: {}\nSource: {} | Time Filter: {} | Rates: {} | Analysis: {}\nExecution ID: {}\n\n{}",
+                        query, market, bond_type, maturity, query_priority, recommended_tokens, source_used, time_filter, include_rates, include_analysis, execution_id, content
                     ))];
                     ToolResult::success_with_raw(mcp_content, result)
                 };
@@ -177,7 +187,8 @@ impl Tool for BondDataTool {
 }
 
 impl BondDataTool {
-    async fn fetch_bond_data_with_fallbacks(
+    // ENHANCED: Priority-aware bond data fetching with token management
+    async fn fetch_bond_data_with_fallbacks_and_priority(
         &self,
         query: &str,
         market: &str,
@@ -187,15 +198,19 @@ impl BondDataTool {
         time_filter: &str,
         include_rates: bool,
         include_analysis: bool,
+        query_priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str,
     ) -> Result<Value, BrightDataError> {
-        let sources_to_try = self.build_prioritized_sources(query, market, bond_type, data_source);
+        let sources_to_try = self.build_prioritized_sources_with_priority(query, market, bond_type, data_source, query_priority);
         let mut last_error = None;
 
         for (sequence, (source_type, url_or_query, source_name)) in sources_to_try.iter().enumerate() {
             match source_type.as_str() {
                 "direct" => {
-                    match self.fetch_direct_bond_data(url_or_query, query, market, source_name, execution_id, sequence as u64).await {
+                    match self.fetch_direct_bond_data_with_priority(
+                        url_or_query, query, market, source_name, query_priority, token_budget, execution_id, sequence as u64
+                    ).await {
                         Ok(mut result) => {
                             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                             
@@ -214,15 +229,16 @@ impl BondDataTool {
                             
                             result["source_used"] = json!(source_name);
                             result["data_source_type"] = json!("direct");
+                            result["priority"] = json!(format!("{:?}", query_priority));
                             return Ok(result);
                         }
                         Err(e) => last_error = Some(e),
                     }
                 }
                 "search" => {
-                    match self.fetch_search_bond_data(
+                    match self.fetch_search_bond_data_with_priority(
                         url_or_query, market, bond_type, maturity, time_filter,
-                        include_rates, include_analysis, source_name, execution_id, sequence as u64
+                        include_rates, include_analysis, source_name, query_priority, token_budget, execution_id, sequence as u64
                     ).await {
                         Ok(mut result) => {
                             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
@@ -241,6 +257,7 @@ impl BondDataTool {
                             
                             result["source_used"] = json!(source_name);
                             result["data_source_type"] = json!("search");
+                            result["priority"] = json!(format!("{:?}", query_priority));
                             return Ok(result);
                         }
                         Err(e) => last_error = Some(e),
@@ -253,65 +270,89 @@ impl BondDataTool {
         Err(last_error.unwrap_or_else(|| BrightDataError::ToolError("All bond data sources failed".into())))
     }
 
-    fn build_prioritized_sources(&self, query: &str, market: &str, bond_type: &str, data_source: &str) -> Vec<(String, String, String)> {
+    // ENHANCED: Priority-aware source building
+    fn build_prioritized_sources_with_priority(&self, query: &str, market: &str, bond_type: &str, data_source: &str, priority: crate::filters::strategy::QueryPriority) -> Vec<(String, String, String)> {
         let mut sources = Vec::new();
         let query_lower = query.to_lowercase();
 
         match data_source {
             "direct" => {
-                sources.extend(self.get_direct_sources(market, bond_type));
+                sources.extend(self.get_direct_sources_with_priority(market, bond_type, priority));
             }
             "search" => {
-                sources.extend(self.get_search_sources(query, market, bond_type));
+                sources.extend(self.get_search_sources_with_priority(query, market, bond_type, priority));
             }
             "auto" | _ => {
-                // Smart selection based on query content
-                if query_lower.contains("yield") || query_lower.contains("rate") || query_lower.contains("10 year") {
-                    // For yield-specific queries, prioritize direct sources
-                    sources.extend(self.get_direct_sources(market, bond_type));
-                    sources.extend(self.get_search_sources(query, market, bond_type));
-                } else {
-                    // For general bond queries, prioritize search for broader context
-                    sources.extend(self.get_search_sources(query, market, bond_type));
-                    sources.extend(self.get_direct_sources(market, bond_type));
+                // Priority-aware smart selection
+                match priority {
+                    crate::filters::strategy::QueryPriority::Critical => {
+                        // For critical queries, prioritize direct sources for speed
+                        sources.extend(self.get_direct_sources_with_priority(market, bond_type, priority));
+                        sources.extend(self.get_search_sources_with_priority(query, market, bond_type, priority));
+                    }
+                    _ => {
+                        // Smart selection based on query content
+                        if query_lower.contains("yield") || query_lower.contains("rate") || query_lower.contains("10 year") {
+                            sources.extend(self.get_direct_sources_with_priority(market, bond_type, priority));
+                            sources.extend(self.get_search_sources_with_priority(query, market, bond_type, priority));
+                        } else {
+                            sources.extend(self.get_search_sources_with_priority(query, market, bond_type, priority));
+                            sources.extend(self.get_direct_sources_with_priority(market, bond_type, priority));
+                        }
+                    }
                 }
             }
         }
 
+        // Limit sources based on priority to save tokens
+        let max_sources = match priority {
+            crate::filters::strategy::QueryPriority::Critical => sources.len(), // No limit for critical
+            crate::filters::strategy::QueryPriority::High => std::cmp::min(sources.len(), 3),
+            crate::filters::strategy::QueryPriority::Medium => std::cmp::min(sources.len(), 2),
+            crate::filters::strategy::QueryPriority::Low => std::cmp::min(sources.len(), 1),
+        };
+
+        sources.truncate(max_sources);
         sources
     }
 
-    fn get_direct_sources(&self, market: &str, bond_type: &str) -> Vec<(String, String, String)> {
+    fn get_direct_sources_with_priority(&self, market: &str, bond_type: &str, priority: crate::filters::strategy::QueryPriority) -> Vec<(String, String, String)> {
         let mut sources = Vec::new();
 
         match market {
             "indian" => {
                 sources.push(("direct".to_string(), "https://www.rbi.org.in/scripts/BS_PressReleaseDisplay.aspx".to_string(), "RBI Press Releases".to_string()));
-                sources.push(("direct".to_string(), "https://www.nseindia.com/market-data/bonds-debentures".to_string(), "NSE Bonds".to_string()));
-                sources.push(("direct".to_string(), "https://www.bseindia.com/markets/debt/debt_main.aspx".to_string(), "BSE Debt Market".to_string()));
+                if matches!(priority, crate::filters::strategy::QueryPriority::Critical | crate::filters::strategy::QueryPriority::High) {
+                    sources.push(("direct".to_string(), "https://www.nseindia.com/market-data/bonds-debentures".to_string(), "NSE Bonds".to_string()));
+                    sources.push(("direct".to_string(), "https://www.bseindia.com/markets/debt/debt_main.aspx".to_string(), "BSE Debt Market".to_string()));
+                }
                 if bond_type == "government" || bond_type == "all" {
                     sources.push(("direct".to_string(), "https://dbie.rbi.org.in/DBIE/dbie.rbi?site=home".to_string(), "RBI Database".to_string()));
                 }
             }
             "us" => {
                 sources.push(("direct".to_string(), "https://www.treasury.gov/resource-center/data-chart-center/interest-rates/".to_string(), "US Treasury".to_string()));
-                sources.push(("direct".to_string(), "https://www.federalreserve.gov/releases/h15/".to_string(), "Federal Reserve H.15".to_string()));
-                sources.push(("direct".to_string(), "https://fred.stlouisfed.org/categories/22".to_string(), "FRED Economic Data".to_string()));
+                if matches!(priority, crate::filters::strategy::QueryPriority::Critical | crate::filters::strategy::QueryPriority::High) {
+                    sources.push(("direct".to_string(), "https://www.federalreserve.gov/releases/h15/".to_string(), "Federal Reserve H.15".to_string()));
+                    sources.push(("direct".to_string(), "https://fred.stlouisfed.org/categories/22".to_string(), "FRED Economic Data".to_string()));
+                }
                 if bond_type == "corporate" || bond_type == "all" {
                     sources.push(("direct".to_string(), "https://www.finra.org/investors/market-data".to_string(), "FINRA Market Data".to_string()));
                 }
             }
             "global" | _ => {
                 sources.push(("direct".to_string(), "https://www.investing.com/rates-bonds/".to_string(), "Investing.com Bonds".to_string()));
-                sources.push(("direct".to_string(), "https://www.bloomberg.com/markets/rates-bonds".to_string(), "Bloomberg Bonds".to_string()));
-                sources.push(("direct".to_string(), "https://www.marketwatch.com/investing/bonds".to_string(), "MarketWatch Bonds".to_string()));
+                if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
+                    sources.push(("direct".to_string(), "https://www.bloomberg.com/markets/rates-bonds".to_string(), "Bloomberg Bonds".to_string()));
+                    sources.push(("direct".to_string(), "https://www.marketwatch.com/investing/bonds".to_string(), "MarketWatch Bonds".to_string()));
+                }
             }
         }
 
         sources
     }
 
-    fn get_search_sources(&self, query: &str, market: &str, bond_type: &str) -> Vec<(String, String, String)> {
+    fn get_search_sources_with_priority(&self, query: &str, market: &str, bond_type: &str, priority: crate::filters::strategy::QueryPriority) -> Vec<(String, String, String)> {
         let mut sources = Vec::new();
         let market_terms = match market {
             "indian" => "india RBI government bond yield NSE BSE debt market",
@@ -329,28 +370,40 @@ impl BondDataTool {
             _ => "bond yield interest rate market"
         };
 
-        // Enhanced search queries
-        sources.push(("search".to_string(), 
-            format!("{} {} {} current rate yield today", query, market_terms, bond_type_terms),
-            "Enhanced Bond Search".to_string()));
-
-        sources.push(("search".to_string(), 
-            format!("{} {} latest data yield curve analysis", query, market_terms),
-            "Bond Market Analysis".to_string()));
-
-        sources.push(("search".to_string(), 
-            format!("{} {} performance trends rating", query, bond_type_terms),
-            "Bond Performance Search".to_string()));
+        // Priority-based search query construction
+        match priority {
+            crate::filters::strategy::QueryPriority::Critical => {
+                sources.push(("search".to_string(), 
+                    format!("{} {} current yield live today", query, market_terms),
+                    "Critical Bond Search".to_string()));
+            }
+            crate::filters::strategy::QueryPriority::High => {
+                sources.push(("search".to_string(), 
+                    format!("{} {} {} current rate yield today", query, market_terms, bond_type_terms),
+                    "High Priority Bond Search".to_string()));
+                sources.push(("search".to_string(), 
+                    format!("{} {} latest data yield curve analysis", query, market_terms),
+                    "Bond Market Analysis".to_string()));
+            }
+            _ => {
+                sources.push(("search".to_string(), 
+                    format!("{} {} performance trends rating", query, bond_type_terms),
+                    "Bond Performance Search".to_string()));
+            }
+        }
 
         sources
     }
 
-    async fn fetch_direct_bond_data(
+    // ENHANCED: Priority-aware direct bond data fetching
+    async fn fetch_direct_bond_data_with_priority(
         &self,
         url: &str,
         query: &str,
         market: &str,
         source_name: &str,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str,
         sequence: u64,
     ) -> Result<Value, BrightDataError> {
@@ -364,15 +417,25 @@ impl BondDataTool {
         let zone = env::var("WEB_UNLOCKER_ZONE")
             .unwrap_or_else(|_| "default".to_string());
 
-        info!("🏛️ Direct bond data fetch from {} using zone: {} (execution: {})", source_name, zone, execution_id);
+        info!("🏛️ Priority {} direct bond data fetch from {} using zone: {} (execution: {})", 
+              format!("{:?}", priority), source_name, zone, execution_id);
 
-        let payload = json!({
+        let mut payload = json!({
             "url": url,
             "zone": zone,
             "format": "raw",
             "data_format": "markdown",
-            "render": true // Enable JavaScript rendering for dynamic content
+            "render": true
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -419,7 +482,7 @@ impl BondDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters conditionally based on environment variable
+        // Apply priority-aware filters conditionally based on environment variable
         let filtered_content = if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
@@ -427,7 +490,9 @@ impl BondDataTool {
             if ResponseFilter::is_error_page(&raw_content) {
                 return Err(BrightDataError::ToolError(format!("{} returned error page", source_name)));
             } else {
-                ResponseFilter::filter_financial_content(&raw_content)
+                // Use enhanced extraction with token budget awareness
+                let max_tokens = token_budget / 2; // Reserve tokens for formatting
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
             }
         } else {
             raw_content.clone()
@@ -437,13 +502,16 @@ impl BondDataTool {
             "content": filtered_content,
             "query": query,
             "market": market,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget,
             "execution_id": execution_id,
             "sequence": sequence,
             "success": true
         }))
     }
 
-    async fn fetch_search_bond_data(
+    // ENHANCED: Priority-aware search bond data fetching
+    async fn fetch_search_bond_data_with_priority(
         &self,
         search_query: &str,
         market: &str,
@@ -453,6 +521,8 @@ impl BondDataTool {
         include_rates: bool,
         include_analysis: bool,
         source_name: &str,
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
         execution_id: &str,
         sequence: u64,
     ) -> Result<Value, BrightDataError> {
@@ -466,28 +536,50 @@ impl BondDataTool {
         let zone = env::var("BRIGHTDATA_SERP_ZONE")
             .unwrap_or_else(|_| "serp_api2".to_string());
 
-        // Build enhanced search query
+        // Build enhanced search query with priority awareness
         let mut enhanced_query = search_query.to_string();
         
-        if include_rates {
-            enhanced_query.push_str(" current yield rate");
-        }
-        
-        if include_analysis {
-            enhanced_query.push_str(" market analysis trends forecast");
+        // Add terms based on priority
+        match priority {
+            crate::filters::strategy::QueryPriority::Critical => {
+                enhanced_query.push_str(" current live real-time");
+            }
+            crate::filters::strategy::QueryPriority::High => {
+                if include_rates {
+                    enhanced_query.push_str(" current yield rate");
+                }
+                if include_analysis {
+                    enhanced_query.push_str(" market analysis trends");
+                }
+            }
+            _ => {
+                // Basic terms for lower priority
+                enhanced_query.push_str(" overview");
+            }
         }
 
-        match maturity {
-            "short" => enhanced_query.push_str(" short term 1-3 year"),
-            "medium" => enhanced_query.push_str(" medium term 3-10 year"),
-            "long" => enhanced_query.push_str(" long term 10+ year"),
-            _ => {}
+        // Add maturity only for higher priority queries
+        if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
+            match maturity {
+                "short" => enhanced_query.push_str(" short term 1-3 year"),
+                "medium" => enhanced_query.push_str(" medium term 3-10 year"),
+                "long" => enhanced_query.push_str(" long term 10+ year"),
+                _ => {}
+            }
         }
 
-        // Build SERP API query parameters
+        // Build SERP API query parameters with priority-based limits
         let mut query_params = HashMap::new();
         query_params.insert("q".to_string(), enhanced_query.clone());
-        query_params.insert("num".to_string(), "20".to_string()); // More results for better data
+        
+        // Adjust results based on priority
+        let num_results = match priority {
+            crate::filters::strategy::QueryPriority::Critical => "20",
+            crate::filters::strategy::QueryPriority::High => "15", 
+            crate::filters::strategy::QueryPriority::Medium => "10",
+            crate::filters::strategy::QueryPriority::Low => "5",
+        };
+        query_params.insert("num".to_string(), num_results.to_string());
         
         // Set geographic location based on market
         let country_code = match market {
@@ -498,8 +590,8 @@ impl BondDataTool {
         query_params.insert("gl".to_string(), country_code.to_string());
         query_params.insert("hl".to_string(), "en".to_string());
         
-        // Time-based filtering
-        if time_filter != "any" {
+        // Time-based filtering (skip for low priority to save tokens)
+        if time_filter != "any" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
             let tbs_value = match time_filter {
                 "day" => "qdr:d",
                 "week" => "qdr:w",
@@ -512,9 +604,10 @@ impl BondDataTool {
             }
         }
 
-        info!("🔍 Enhanced bond search: {} using zone: {} (execution: {})", enhanced_query.clone(), zone.clone(), execution_id.clone());
+        info!("🔍 Priority {} enhanced bond search: {} using zone: {} (execution: {})", 
+              format!("{:?}", priority), enhanced_query.clone(), zone.clone(), execution_id.clone());
 
-        let payload = json!({
+        let mut payload = json!({
             "zone": zone,
             "url": "https://www.google.com/search",
             "format": "json",
@@ -522,6 +615,15 @@ impl BondDataTool {
             "render": true,
             "data_format": "markdown"
         });
+
+        // Add priority processing hints
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            payload["processing_priority"] = json!(format!("{:?}", priority));
+            payload["token_budget"] = json!(token_budget);
+        }
 
         let client = Client::builder()
             .timeout(Duration::from_secs(120))
@@ -568,7 +670,7 @@ impl BondDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters conditionally
+        // Apply priority-aware filters conditionally
         let filtered_content = if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
@@ -576,7 +678,8 @@ impl BondDataTool {
             if ResponseFilter::is_error_page(&raw_content) {
                 return Err(BrightDataError::ToolError(format!("{} search returned error page", source_name)));
             } else {
-                ResponseFilter::filter_financial_content(&raw_content)
+                let max_tokens = token_budget / 3; // Reserve tokens for formatting
+                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
             }
         } else {
             raw_content.clone()
@@ -588,6 +691,8 @@ impl BondDataTool {
             "market": market,
             "bond_type": bond_type,
             "maturity": maturity,
+            "priority": format!("{:?}", priority),
+            "token_budget": token_budget,
             "execution_id": execution_id,
             "sequence": sequence,
             "success": true
