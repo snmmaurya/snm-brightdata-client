@@ -1,9 +1,8 @@
-// src/client.rs
+// src/client.rs - Cleaned up version (removed duplicate tool execution)
 use crate::{config::BrightDataConfig, error::BrightDataError};
 use reqwest::Client;
 use serde_json::Value;
 use anyhow::{Result, anyhow};
-use crate::tool::ToolResolver;
 
 pub struct BrightDataClient {
     config: BrightDataConfig,
@@ -18,6 +17,7 @@ impl BrightDataClient {
         }
     }
 
+    /// Direct BrightData API call for basic scraping
     pub async fn get(&self, target_url: &str) -> Result<Value, BrightDataError> {
         let payload = serde_json::json!({
             "url": target_url,
@@ -34,15 +34,5 @@ impl BrightDataClient {
             .await?;
 
         Ok(res)
-    }
-
-    pub async fn run(&self, tool_name: &str, input: Value) -> Result<Value> {
-        let resolver = ToolResolver::default();
-        let tool = resolver
-            .resolve(tool_name)
-            .ok_or_else(|| anyhow!("Tool `{tool_name}` not found"))?;
-        
-        // Use legacy method for backward compatibility
-        tool.execute_legacy(input).await.map_err(|e| anyhow!(e))
     }
 }

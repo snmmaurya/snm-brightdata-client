@@ -6,6 +6,21 @@ pub enum BrightDataError {
     #[error("Request failed: {0}")]
     Request(#[from] reqwest::Error),
 
+    #[error("Network error: {0}")]
+    NetworkError(String),
+
+    #[error("API error: {0}")]
+    ApiError(String),
+
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Config error: {0}")]
+    ConfigError(String),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+
     #[error("Unexpected error: {0}")]
     Unexpected(#[from] anyhow::Error),
 
@@ -17,4 +32,7 @@ pub enum BrightDataError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Tool not found: {0}")]
+    ToolNotFound(String),
 }

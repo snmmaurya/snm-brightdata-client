@@ -37,7 +37,7 @@ impl Tool for MultiZoneSearch {
         })
     }
 
-    async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+    async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let query = parameters
             .get("query")
             .and_then(|v| v.as_str())
@@ -72,11 +72,10 @@ impl Tool for MultiZoneSearch {
                 let tool = SearchEngine;
                 let args = json!({
                     "query": q,
-                    "engine": e,
-                    "zone": zone
+                    "engine": e
                 });
 
-                let result = tool.execute(args).await;
+                let result = tool.execute_internal(args).await;
                 (result, zone)
             });
 

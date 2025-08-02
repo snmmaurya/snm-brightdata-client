@@ -1,11 +1,13 @@
-// src/tools/market.rs
+// src/tools/market.rs - Enhanced with BrightData SERP API parameters - FIXED VERSION
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
+use crate::logger::JSON_LOGGER;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::env;
 use std::time::Duration;
+use std::collections::HashMap;
 
 pub struct MarketOverviewTool;
 
@@ -16,7 +18,7 @@ impl Tool for MarketOverviewTool {
     }
 
     fn description(&self) -> &str {
-        "Get comprehensive market overview including major indices, sector performance, market sentiment, and overall market trends"
+        "Get comprehensive market overview with enhanced search parameters including pagination and localization"
     }
 
     fn input_schema(&self) -> Value {
@@ -34,13 +36,38 @@ impl Tool for MarketOverviewTool {
                     "enum": ["indian", "us", "global"],
                     "default": "indian",
                     "description": "Market region"
+                },
+                "page": {
+                    "type": "integer",
+                    "description": "Page number for pagination (1-based)",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 1
+                },
+                "num_results": {
+                    "type": "integer",
+                    "description": "Number of results per page (10-100)",
+                    "minimum": 10,
+                    "maximum": 100,
+                    "default": 20
+                },
+                "time_filter": {
+                    "type": "string",
+                    "enum": ["any", "hour", "day", "week", "month", "year"],
+                    "description": "Time-based filter for results",
+                    "default": "day"
+                },
+                "use_serp_api": {
+                    "type": "boolean",
+                    "description": "Use enhanced SERP API with advanced parameters",
+                    "default": true
                 }
             },
             "required": []
         })
     }
 
-    async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+    async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let market_type = parameters
             .get("market_type")
             .and_then(|v| v.as_str())
@@ -51,22 +78,210 @@ impl Tool for MarketOverviewTool {
             .and_then(|v| v.as_str())
             .unwrap_or("indian");
 
-        let result = self.fetch_market_overview(market_type, region).await?;
+        let page = parameters
+            .get("page")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(1) as u32;
+
+        let num_results = parameters
+            .get("num_results")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(20) as u32;
+
+        let time_filter = parameters
+            .get("time_filter")
+            .and_then(|v| v.as_str())
+            .unwrap_or("day");
+
+        let use_serp_api = parameters
+            .get("use_serp_api")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let execution_id = format!("market_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+        
+        let result = if use_serp_api {
+            self.fetch_market_overview_enhanced(
+                market_type, region, page, num_results, time_filter, &execution_id
+            ).await?
+        } else {
+            self.fetch_market_overview_legacy(market_type, region, &execution_id).await?
+        };
 
         let content_text = result.get("content").and_then(|c| c.as_str()).unwrap_or("No market data found");
-        let mcp_content = vec![McpContent::text(format!(
-            "📊 **Market Overview - {} Market ({})**\n\n{}",
-            market_type.to_uppercase(),
-            region.to_uppercase(),
-            content_text
-        ))];
+        
+        let mcp_content = if use_serp_api {
+            vec![McpContent::text(format!(
+                "📊 **Enhanced Market Overview - {} Market ({})**\n\nPage: {} | Results: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
+                market_type.to_uppercase(),
+                region.to_uppercase(),
+                page,
+                num_results,
+                time_filter,
+                execution_id,
+                content_text
+            ))]
+        } else {
+            vec![McpContent::text(format!(
+                "📊 **Market Overview - {} Market ({})**\n\nExecution ID: {}\n\n{}",
+                market_type.to_uppercase(),
+                region.to_uppercase(),
+                execution_id,
+                content_text
+            ))]
+        };
 
         Ok(ToolResult::success_with_raw(mcp_content, result))
     }
 }
 
 impl MarketOverviewTool {
-    async fn fetch_market_overview(&self, market_type: &str, region: &str) -> Result<Value, BrightDataError> {
+    async fn fetch_market_overview_enhanced(
+        &self, 
+        market_type: &str, 
+        region: &str, 
+        page: u32,
+        num_results: u32,
+        time_filter: &str,
+        execution_id: &str
+    ) -> Result<Value, BrightDataError> {
+        let api_token = env::var("BRIGHTDATA_API_TOKEN")
+            .or_else(|_| env::var("API_TOKEN"))
+            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
+
+        let base_url = env::var("BRIGHTDATA_BASE_URL")
+            .unwrap_or_else(|_| "https://api.brightdata.com".to_string());
+
+        let zone = env::var("BRIGHTDATA_SERP_ZONE")
+            .unwrap_or_else(|_| "serp_api2".to_string());
+
+        // Build search query based on parameters
+        let query = self.build_market_query(market_type, region);
+        
+        // Build enhanced query parameters
+        let mut query_params = HashMap::new();
+        query_params.insert("q".to_string(), query.clone());
+        
+        // Pagination
+        if page > 1 {
+            let start = (page - 1) * num_results;
+            query_params.insert("start".to_string(), start.to_string());
+        }
+        query_params.insert("num".to_string(), num_results.to_string());
+        
+        // Localization based on region
+        let (country, language) = self.get_region_settings(region);
+        if !country.is_empty() {
+            query_params.insert("gl".to_string(), country.to_string());
+        }
+        query_params.insert("hl".to_string(), language.to_string());
+        
+        // Time-based filtering
+        if time_filter != "any" {
+            let tbs_value = match time_filter {
+                "hour" => "qdr:h",
+                "day" => "qdr:d",
+                "week" => "qdr:w",
+                "month" => "qdr:m",
+                "year" => "qdr:y",
+                _ => ""
+            };
+            if !tbs_value.is_empty() {
+                query_params.insert("tbs".to_string(), tbs_value.to_string());
+            }
+        }
+
+        // News search for market data
+        query_params.insert("tbm".to_string(), "nws".to_string());
+
+        log::info!("🔍 Enhanced Market API search: {} (region: {}, page: {}, results: {}) using zone: {} (execution: {})", 
+                   query, region, page, num_results, zone, execution_id);
+
+        // Build URL with query parameters - FIXED VERSION
+        let mut search_url = "https://www.google.com/search".to_string();
+        let query_string = query_params.iter()
+            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        
+        if !query_string.is_empty() {
+            search_url = format!("{}?{}", search_url, query_string);
+        }
+
+        // Use BrightData SERP API payload with URL containing parameters - FIXED VERSION
+        let payload = json!({
+            "url": search_url,
+            "zone": zone,
+            "format": "raw",
+            "render": true,
+            "data_format": "markdown"
+        });
+
+        let client = Client::builder()
+            .timeout(Duration::from_secs(90))
+            .build()
+            .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
+
+        let response = client
+            .post(&format!("{}/request", base_url))
+            .header("Authorization", format!("Bearer {}", api_token))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| BrightDataError::ToolError(format!("Enhanced market request failed: {}", e)))?;
+
+        let status = response.status().as_u16();
+        let response_headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        // Log BrightData request
+        if let Err(e) = JSON_LOGGER.log_brightdata_request(
+            execution_id,
+            &zone,
+            &format!("Enhanced Market: {} ({})", query, region),
+            payload.clone(),
+            status,
+            response_headers,
+            "markdown"
+        ).await {
+            log::warn!("Failed to log BrightData request: {}", e);
+        }
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            return Err(BrightDataError::ToolError(format!(
+                "BrightData enhanced market overview error {}: {}",
+                status, error_text
+            )));
+        }
+
+        let content = response.text().await
+            .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
+
+        // Format the results
+        let formatted_content = self.format_market_results(&content, market_type, region, page, num_results);
+
+        Ok(json!({
+            "content": formatted_content,
+            "query": query,
+            "market_type": market_type,
+            "region": region,
+            "page": page,
+            "num_results": num_results,
+            "time_filter": time_filter,
+            "zone": zone,
+            "execution_id": execution_id,
+            "raw_response": content,
+            "success": true,
+            "api_type": "enhanced_serp"
+        }))
+    }
+
+    async fn fetch_market_overview_legacy(&self, market_type: &str, region: &str, execution_id: &str) -> Result<Value, BrightDataError> {
         let api_token = env::var("BRIGHTDATA_API_TOKEN")
             .or_else(|_| env::var("API_TOKEN"))
             .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
@@ -77,7 +292,6 @@ impl MarketOverviewTool {
         let zone = env::var("WEB_UNLOCKER_ZONE")
             .unwrap_or_else(|_| "default".to_string());
 
-        // Build market overview search URL
         let search_url = match (region, market_type) {
             ("indian", "stocks") => "https://www.google.com/search?q=indian stock market today nifty sensex BSE NSE performance".to_string(),
             ("indian", "crypto") => "https://www.google.com/search?q=cryptocurrency market india bitcoin ethereum price today".to_string(),
@@ -121,8 +335,27 @@ impl MarketOverviewTool {
             .await
             .map_err(|e| BrightDataError::ToolError(format!("Market overview request failed: {}", e)))?;
 
-        let status = response.status();
-        if !status.is_success() {
+        let status = response.status().as_u16();
+        let response_headers: HashMap<String, String> = response
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+
+        // Log BrightData request
+        if let Err(e) = JSON_LOGGER.log_brightdata_request(
+            execution_id,
+            &zone,
+            &search_url,
+            payload.clone(),
+            status,
+            response_headers,
+            "markdown"
+        ).await {
+            log::warn!("Failed to log BrightData request: {}", e);
+        }
+
+        if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(BrightDataError::ToolError(format!(
                 "BrightData market overview error {}: {}",
@@ -137,7 +370,93 @@ impl MarketOverviewTool {
             "content": content,
             "market_type": market_type,
             "region": region,
-            "success": true
+            "execution_id": execution_id,
+            "success": true,
+            "api_type": "legacy"
         }))
+    }
+
+    fn build_market_query(&self, market_type: &str, region: &str) -> String {
+        match (region, market_type) {
+            ("indian", "stocks") => "indian stock market today nifty sensex BSE NSE performance".to_string(),
+            ("indian", "crypto") => "cryptocurrency market india bitcoin ethereum price today".to_string(),
+            ("indian", "bonds") => "indian bond market government bonds yield RBI today".to_string(),
+            ("indian", "commodities") => "commodity market india gold silver oil prices today".to_string(),
+            ("indian", "overall") => "indian financial market overview today nifty sensex rupee".to_string(),
+            
+            ("us", "stocks") => "US stock market today dow jones s&p nasdaq performance".to_string(),
+            ("us", "crypto") => "cryptocurrency market USA bitcoin ethereum price today".to_string(),
+            ("us", "bonds") => "US bond market treasury yield federal reserve today".to_string(),
+            ("us", "commodities") => "commodity market USA gold oil prices futures today".to_string(),
+            ("us", "overall") => "US financial market overview today wall street performance".to_string(),
+            
+            ("global", "stocks") => "global stock market overview world indices performance today".to_string(),
+            ("global", "crypto") => "global cryptocurrency market bitcoin ethereum worldwide today".to_string(),
+            ("global", "bonds") => "global bond market sovereign yields worldwide today".to_string(),
+            ("global", "commodities") => "global commodity market gold oil silver prices worldwide".to_string(),
+            ("global", "overall") => "global financial market overview world economy today".to_string(),
+            
+            _ => format!("{} {} market overview today", region, market_type)
+        }
+    }
+
+    fn get_region_settings(&self, region: &str) -> (&str, &str) {
+        match region {
+            "indian" => ("in", "en"),
+            "us" => ("us", "en"),
+            "global" => ("", "en"), // Empty country for global
+            _ => ("us", "en")
+        }
+    }
+
+    fn format_market_results(&self, content: &str, market_type: &str, region: &str, page: u32, num_results: u32) -> String {
+        let mut formatted = String::new();
+        
+        // Add header with search parameters
+        formatted.push_str(&format!("# Market Overview: {} Market ({})\n\n", 
+            market_type.to_uppercase(), region.to_uppercase()));
+        formatted.push_str(&format!("**Page**: {} | **Results per page**: {}\n\n", page, num_results));
+        
+        // Try to parse JSON response if available
+        if let Ok(json_data) = serde_json::from_str::<Value>(content) {
+            // If we get structured JSON, format it nicely
+            if let Some(results) = json_data.get("organic_results").and_then(|r| r.as_array()) {
+                formatted.push_str("## Market News & Analysis\n\n");
+                for (i, result) in results.iter().take(num_results as usize).enumerate() {
+                    let title = result.get("title").and_then(|t| t.as_str()).unwrap_or("No title");
+                    let link = result.get("link").and_then(|l| l.as_str()).unwrap_or("");
+                    let snippet = result.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
+                    
+                    formatted.push_str(&format!("### {}. {}\n", i + 1, title));
+                    if !link.is_empty() {
+                        formatted.push_str(&format!("**Source**: {}\n", link));
+                    }
+                    if !snippet.is_empty() {
+                        formatted.push_str(&format!("**Summary**: {}\n", snippet));
+                    }
+                    formatted.push_str("\n");
+                }
+            } else {
+                // JSON but no organic_results, return formatted JSON
+                formatted.push_str("## Market Data\n\n");
+                formatted.push_str("```json\n");
+                formatted.push_str(&serde_json::to_string_pretty(&json_data).unwrap_or_else(|_| content.to_string()));
+                formatted.push_str("\n```\n");
+            }
+        } else {
+            // Plain text/markdown response
+            formatted.push_str("## Market Information\n\n");
+            formatted.push_str(content);
+        }
+        
+        // Add pagination info
+        if page > 1 || num_results < 100 {
+            formatted.push_str(&format!("\n---\n*Page {} of market overview results*\n", page));
+            if page > 1 {
+                formatted.push_str("💡 *To get more results, use page parameter*\n");
+            }
+        }
+        
+        formatted
     }
 }
