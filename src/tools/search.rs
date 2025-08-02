@@ -39,15 +39,15 @@ impl Tool for SearchEngine {
                     "type": "integer",
                     "description": "Page number for pagination (1-based)",
                     "minimum": 1,
-                    "maximum": 10,
+                    "maximum": 1,
                     "default": 1
                 },
                 "num_results": {
                     "type": "integer", 
                     "description": "Number of results per page (10-100)",
-                    "minimum": 10,
-                    "maximum": 100,
-                    "default": 10
+                    "minimum": 1,
+                    "maximum": 1,
+                    "default": 1
                 },
                 "country": {
                     "type": "string",
