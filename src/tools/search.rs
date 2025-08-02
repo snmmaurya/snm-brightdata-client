@@ -1,7 +1,8 @@
-// src/tools/search.rs - Enhanced with BrightData SERP API parameters - FIXED VERSION
+// src/tools/search.rs - Enhanced with BrightData SERP API parameters and optional filtering
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
+use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use reqwest::Client;
@@ -138,6 +139,17 @@ impl Tool for SearchEngine {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, "search", "validation", json!({}), response_type));
+            }
+        }
+
         let execution_id = self.generate_execution_id();
         
         let result = if use_serp_api {
@@ -146,25 +158,51 @@ impl Tool for SearchEngine {
                 safe_search, time_filter, search_type, &execution_id
             ).await?
         } else {
-            // Fallback to your original method
+            // Fallback to original method
             self.search_with_brightdata(query, engine, &execution_id).await?
         };
 
-        let content_text = result.get("content").and_then(|c| c.as_str()).unwrap_or("No results");
-        
-        let mcp_content = if use_serp_api {
-            vec![McpContent::text(format!(
-                "🔍 **Enhanced Search Results for '{}'**\n\nEngine: {} | Page: {} | Results: {} | Country: {} | Language: {}\nSearch Type: {} | Safe Search: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
-                query, engine, page, num_results, country, language, search_type, safe_search, time_filter, execution_id, content_text
-            ))]
+        let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let source_used = if use_serp_api { "Enhanced SERP" } else { "Legacy" };
+
+        // Create appropriate response based on whether filtering is enabled
+        let tool_result = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            ResponseStrategy::create_financial_response(
+                "search", query, "web", source_used, content, result.clone()
+            )
         } else {
-            vec![McpContent::text(format!(
-                "🔍 **Search Results for '{}'**\n\nEngine: {}\nExecution ID: {}\n\n{}",
-                query, engine, execution_id, content_text
-            ))]
+            // No filtering - create standard response
+            let content_text = if use_serp_api {
+                result.get("formatted_content").and_then(|c| c.as_str()).unwrap_or(content)
+            } else {
+                content
+            };
+
+            let mcp_content = if use_serp_api {
+                vec![McpContent::text(format!(
+                    "🔍 **Enhanced Search Results for '{}'**\n\nEngine: {} | Page: {} | Results: {} | Country: {} | Language: {}\nSearch Type: {} | Safe Search: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
+                    query, engine, page, num_results, country, language, search_type, safe_search, time_filter, execution_id, content_text
+                ))]
+            } else {
+                vec![McpContent::text(format!(
+                    "🔍 **Search Results for '{}'**\n\nEngine: {}\nExecution ID: {}\n\n{}",
+                    query, engine, execution_id, content_text
+                ))]
+            };
+            ToolResult::success_with_raw(mcp_content, result)
         };
 
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+        // Apply size limits only if filtering enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            Ok(ResponseStrategy::apply_size_limits(tool_result))
+        } else {
+            Ok(tool_result)
+        }
     }
 }
 
@@ -314,14 +352,31 @@ impl SearchEngine {
             )));
         }
 
-        let content = response.text().await
+        let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(format!("Failed to read SERP response: {}", e)))?;
 
+        // Apply filters conditionally based on environment variable
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError("Enhanced search returned error page".into()));
+            } else if ResponseStrategy::should_try_next_source(&raw_content) {
+                return Err(BrightDataError::ToolError("Content quality too low".into()));
+            } else {
+                ResponseFilter::filter_financial_content(&raw_content)
+            }
+        } else {
+            raw_content.clone()
+        };
+
         // Format the results for better readability
-        let formatted_content = self.format_search_results(&content, query, page, num_results, search_type);
+        let formatted_content = self.format_search_results(&filtered_content, query, page, num_results, search_type);
 
         Ok(json!({
-            "content": formatted_content,
+            "content": filtered_content,
+            "formatted_content": formatted_content,
             "query": query,
             "engine": engine,
             "page": page,
@@ -333,13 +388,13 @@ impl SearchEngine {
             "time_filter": time_filter,
             "zone": zone,
             "execution_id": execution_id,
-            "raw_response": content,
+            "raw_response": raw_content,
             "success": true,
             "api_type": "serp_api"
         }))
     }
 
-    // Your original method (preserved for backward compatibility)
+    // Original method (preserved for backward compatibility)
     async fn search_with_brightdata(&self, query: &str, engine: &str, execution_id: &str) -> Result<Value, BrightDataError> {
         let api_token = std::env::var("BRIGHTDATA_API_TOKEN")
             .or_else(|_| std::env::var("API_TOKEN"))
@@ -403,11 +458,25 @@ impl SearchEngine {
             )));
         }
 
-        let content = response.text().await
+        let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(format!("Failed to read response: {}", e)))?;
 
+        // Apply filters conditionally
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError("Search returned error page".into()));
+            } else {
+                ResponseFilter::filter_financial_content(&raw_content)
+            }
+        } else {
+            raw_content.clone()
+        };
+
         Ok(json!({
-            "content": content,
+            "content": filtered_content,
             "query": query,
             "engine": engine,
             "search_url": search_url,

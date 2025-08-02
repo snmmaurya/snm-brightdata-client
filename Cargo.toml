@@ -1,8 +1,8 @@
 [package]
 name = "snm-brightdata-client"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
-description = "Bright Data MCP Client implemented in Rust with Actix Web"
+description = "Bright Data Wrapper Client Highly compacted Data implemented in Rust with Actix Web"
 authors = ["Inx Maurya <you@example.com>"]
 license = "MIT"
 repository = "https://github.com/snmmaurya/snm-brightdata-client"

@@ -1,4 +1,4 @@
-// src/filters/response_filter.rs - Ultra-compact version optimized for 5K token budget
+// src/filters/response_filter.rs - Ultra-compact version with optional filtering
 use regex::Regex;
 use std::sync::OnceLock;
 
@@ -9,8 +9,19 @@ static ESSENTIAL_REGEX: OnceLock<Regex> = OnceLock::new();
 pub struct ResponseFilter;
 
 impl ResponseFilter {
+    /// Check if truncate filtering is enabled via environment variable
+    pub fn is_truncate_filter_enabled() -> bool {
+        std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
+    }
+
     /// HYPER-aggressive financial content filtering - extract only essential numbers
     pub fn filter_financial_content(content: &str) -> String {
+        if !Self::is_truncate_filter_enabled() {
+            return content.to_string();
+        }
+
         // First try to extract structured essential data
         let essential = Self::extract_only_essential_metrics(content);
         if !essential.is_empty() && essential != "No data" {
@@ -135,6 +146,10 @@ impl ResponseFilter {
     
     /// HYPER-aggressive truncation for token efficiency
     pub fn truncate_content(content: &str, max_chars: usize) -> String {
+        if !Self::is_truncate_filter_enabled() {
+            return content.to_string();
+        }
+
         if content.len() <= max_chars {
             return content.to_string();
         }
@@ -198,6 +213,10 @@ impl ResponseFilter {
     
     /// NEW: Smart financial data extraction prioritizing high-value info
     pub fn extract_high_value_financial_data(content: &str, max_tokens: usize) -> String {
+        if !Self::is_truncate_filter_enabled() {
+            return content.to_string();
+        }
+
         let max_chars = max_tokens * 3; // 3 chars per token estimate
         
         // Priority order: Price > Market Cap > PE > Volume > Others
@@ -239,6 +258,46 @@ impl ResponseFilter {
             "No data".to_string()
         } else {
             extracted.join("|")
+        }
+    }
+
+    /// NEW: Smart truncation that preserves financial data
+    pub fn smart_truncate_preserving_financial_data(content: &str, max_chars: usize) -> String {
+        if !Self::is_truncate_filter_enabled() {
+            return content.to_string();
+        }
+
+        if content.len() <= max_chars {
+            return content.to_string();
+        }
+        
+        // Find financial data lines first
+        let lines: Vec<&str> = content.lines().collect();
+        let mut essential_lines = Vec::new();
+        let mut total_chars = 0;
+        
+        for line in lines {
+            let line_lower = line.to_lowercase();
+            if line_lower.contains("₹") || line_lower.contains("$") || 
+               line_lower.contains("price") || line_lower.contains("market") {
+                if total_chars + line.len() <= max_chars {
+                    essential_lines.push(line);
+                    total_chars += line.len() + 1; // +1 for newline
+                } else {
+                    break;
+                }
+            }
+        }
+        
+        if essential_lines.is_empty() {
+            // Fallback: truncate normally but try to end at word boundary
+            if let Some(pos) = content[..max_chars].rfind(' ') {
+                format!("{}…", &content[..pos])
+            } else {
+                format!("{}…", &content[..max_chars.saturating_sub(1)])
+            }
+        } else {
+            essential_lines.join("\n")
         }
     }
 }

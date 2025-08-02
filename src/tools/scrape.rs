@@ -1,7 +1,8 @@
-// src/tools/scrape.rs - Supports multiple BrightData credential types
+// src/tools/scrape.rs - Supports multiple BrightData credential types with optional filtering
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
+use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use reqwest::Client;
@@ -134,6 +135,17 @@ impl Tool for ScrapeMarkdown {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", url);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", url, "scrape", "validation", json!({}), response_type));
+            }
+        }
+
         let execution_id = self.generate_execution_id();
         
         // Auto-detect best available method
@@ -166,25 +178,47 @@ impl Tool for ScrapeMarkdown {
             }
         };
         
-        let content_text = result.get("content").and_then(|c| c.as_str()).unwrap_or("No content");
-        
-        let mcp_content = vec![McpContent::text(format!(
-            "🌐 **BrightData Scrape from {}**\n\nMethod: {} | Format: {} | Country: {} | Mobile: {}\nZone/Service: {} | Execution ID: {}\n\n{}",
-            url,
-            selected_method.to_uppercase(),
-            format,
-            if country.is_empty() { "Auto" } else { country },
-            mobile,
-            result.get("service").and_then(|z| z.as_str()).unwrap_or("unknown"),
-            execution_id,
-            if content_text.len() > 2000 { 
-                format!("{}... (truncated - {} total chars)", &content_text[..2000], content_text.len())
-            } else { 
-                content_text.to_string() 
-            }
-        ))];
+        let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let service_used = result.get("service").and_then(|s| s.as_str()).unwrap_or("Unknown");
 
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+        // Create appropriate response based on whether filtering is enabled
+        let tool_result = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            ResponseStrategy::create_financial_response(
+                "scrape", url, "web", service_used, content, result.clone()
+            )
+        } else {
+            // No filtering - create standard response
+            let content_text = if content.len() > 2000 { 
+                format!("{}... (truncated - {} total chars)", &content[..2000], content.len())
+            } else { 
+                content.to_string() 
+            };
+
+            let mcp_content = vec![McpContent::text(format!(
+                "🌐 **BrightData Scrape from {}**\n\nMethod: {} | Format: {} | Country: {} | Mobile: {}\nZone/Service: {} | Execution ID: {}\n\n{}",
+                url,
+                selected_method.to_uppercase(),
+                format,
+                if country.is_empty() { "Auto" } else { country },
+                mobile,
+                service_used,
+                execution_id,
+                content_text
+            ))];
+            ToolResult::success_with_raw(mcp_content, result)
+        };
+
+        // Apply size limits only if filtering enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            Ok(ResponseStrategy::apply_size_limits(tool_result))
+        } else {
+            Ok(tool_result)
+        }
     }
 }
 
@@ -487,14 +521,26 @@ impl ScrapeMarkdown {
             )));
         }
 
-        let content = response.text().await
+        let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        let processed_content = self.post_process_content(&content, format);
+        // Apply filters conditionally based on environment variable
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError(format!("{} returned error page", service_type)));
+            } else if ResponseStrategy::should_try_next_source(&raw_content) {
+                return Err(BrightDataError::ToolError("Content quality too low".into()));
+            }
+        }
+
+        let processed_content = self.post_process_content(&raw_content, format);
 
         Ok(json!({
             "content": processed_content,
-            "raw_content": content,
+            "raw_content": raw_content,
             "service": service_type,
             "service_name": service_name,
             "execution_id": execution_id,
@@ -503,12 +549,21 @@ impl ScrapeMarkdown {
     }
 
     fn post_process_content(&self, content: &str, format: &str) -> String {
-        match format {
+        let mut processed = match format {
             "screenshot" => {
                 format!("Screenshot captured successfully. Base64 data length: {} characters", content.len())
             }
             "markdown" => content.to_string(),
             _ => content.to_string()
+        };
+
+        // Apply filters conditionally
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) && format != "screenshot" {
+            processed = ResponseFilter::filter_financial_content(&processed);
         }
+
+        processed
     }
 }

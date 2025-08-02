@@ -1,4 +1,4 @@
-// src/tools/extract.rs - Enhanced with smart zone selection and data processing
+// src/tools/extract.rs - Enhanced with smart zone selection, data processing and optional filtering
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -111,10 +111,15 @@ impl Tool for Extractor {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        // Early validation
-        let response_type = ResponseStrategy::determine_response_type("", url);
-        if matches!(response_type, ResponseType::Empty) {
-            return Ok(ResponseStrategy::create_response("", url, "extraction", "validation", json!({}), response_type));
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", url);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", url, "extraction", "validation", json!({}), response_type));
+            }
         }
 
         let execution_id = self.generate_execution_id();
@@ -128,15 +133,40 @@ impl Tool for Extractor {
                     .or_else(|| result.get("content").and_then(|c| c.as_str()))
                     .unwrap_or("");
                 
-                // Create appropriate response
-                let tool_result = ResponseStrategy::create_financial_response(
-                    "extraction", url, "web", "BrightData", content, result.clone()
-                );
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "extraction", url, "web", "BrightData", content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "📊 **Data Extraction from: {}**\n\nData Type: {} | Format: {} | JS Enabled: {}\nExecution ID: {}\n\n{}",
+                        url, data_type, extraction_format, enable_js, execution_id, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
                 
-                Ok(ResponseStrategy::apply_size_limits(tool_result))
+                // Apply size limits only if filtering enabled
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
             }
             Err(e) => {
-                Ok(ResponseStrategy::create_error_response(url, &e.to_string()))
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(url, &e.to_string()))
+                } else {
+                    Err(e)
+                }
             }
         }
     }
@@ -274,6 +304,18 @@ impl Extractor {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
+        // Apply filters conditionally based on environment variable
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError("Extraction returned error page".into()));
+            } else if ResponseStrategy::should_try_next_source(&raw_content) {
+                return Err(BrightDataError::ToolError("Content quality too low".into()));
+            }
+        }
+
         // Process and structure the extracted data
         let processed_data = self.process_extracted_data(
             &raw_content, url, data_type, extraction_format, clean_content
@@ -384,7 +426,10 @@ impl Extractor {
     fn process_content_by_type(&self, content: &str, data_type: &str, clean_content: bool) -> String {
         let mut processed = content.to_string();
 
-        if clean_content {
+        // Apply filters conditionally
+        if clean_content && std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
             processed = ResponseFilter::filter_financial_content(&processed);
         }
 
@@ -413,8 +458,10 @@ impl Extractor {
             }
         }
 
-        // Apply size limits
-        if processed.len() > 10000 {
+        // Apply size limits conditionally
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) && processed.len() > 10000 {
             processed = ResponseFilter::truncate_content(&processed, 10000);
         }
 

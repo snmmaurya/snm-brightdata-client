@@ -1,4 +1,4 @@
-// src/filters/strategy.rs - Ultra-compact version with global token budget management
+// src/filters/strategy.rs - Ultra-compact version with optional token budget management
 use crate::tool::{ToolResult, McpContent};
 use crate::filters::response_filter::ResponseFilter;
 use serde_json::Value;
@@ -38,6 +38,13 @@ pub enum ResponseType {
 }
 
 impl ResponseStrategy {
+    /// Check if truncate filtering is enabled
+    fn is_truncate_filter_enabled() -> bool {
+        std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false)
+    }
+
     /// Initialize global counters
     fn init_counters() {
         GLOBAL_TOKEN_COUNTER.get_or_init(|| Mutex::new(0));
@@ -46,6 +53,10 @@ impl ResponseStrategy {
     
     /// Get current token usage and remaining budget
     pub fn get_token_budget_status() -> (usize, usize) {
+        if !Self::is_truncate_filter_enabled() {
+            return (0, TOTAL_TOKEN_BUDGET); // Return full budget if filtering disabled
+        }
+
         Self::init_counters();
         let used = *GLOBAL_TOKEN_COUNTER.get().unwrap().lock().unwrap();
         let remaining = TOTAL_TOKEN_BUDGET.saturating_sub(used);
@@ -54,6 +65,10 @@ impl ResponseStrategy {
     
     /// Record token usage for a response
     fn record_token_usage(tokens: usize) {
+        if !Self::is_truncate_filter_enabled() {
+            return; // Don't track if filtering disabled
+        }
+
         Self::init_counters();
         
         let mut counter = GLOBAL_TOKEN_COUNTER.get().unwrap().lock().unwrap();
@@ -78,6 +93,11 @@ impl ResponseStrategy {
     pub fn determine_response_type(content: &str, query: &str) -> ResponseType {
         if query.trim().is_empty() || content.trim().is_empty() {
             return ResponseType::Empty;
+        }
+
+        if !Self::is_truncate_filter_enabled() {
+            // If filtering is disabled, always return Filtered for backward compatibility
+            return ResponseType::Filtered;
         }
         
         let (used_tokens, remaining_tokens) = Self::get_token_budget_status();
@@ -164,9 +184,11 @@ impl ResponseStrategy {
             }
         };
         
-        // Estimate and record token usage
-        let estimated_tokens = ResponseFilter::estimate_tokens(&response_text);
-        Self::record_token_usage(estimated_tokens);
+        // Estimate and record token usage only if filtering enabled
+        if Self::is_truncate_filter_enabled() {
+            let estimated_tokens = ResponseFilter::estimate_tokens(&response_text);
+            Self::record_token_usage(estimated_tokens);
+        }
         
         if response_text.is_empty() {
             ToolResult::success_with_text("".to_string())
@@ -192,7 +214,7 @@ impl ResponseStrategy {
     }
     
     /// Ultra-abbreviate queries to save maximum tokens
-    fn ultra_abbreviate_query(query: &str) -> String {
+    pub fn ultra_abbreviate_query(query: &str) -> String {
         let q = query.to_uppercase();
         
         match q.as_str() {
@@ -384,6 +406,10 @@ impl ResponseStrategy {
     
     /// Apply HYPER-AGGRESSIVE size limits with token awareness
     pub fn apply_size_limits(mut result: ToolResult) -> ToolResult {
+        if !Self::is_truncate_filter_enabled() {
+            return result; // No truncation if disabled
+        }
+
         let (_, remaining_tokens) = Self::get_token_budget_status();
         
         // If very low on tokens, truncate aggressively
@@ -415,6 +441,10 @@ impl ResponseStrategy {
     
     /// Enhanced check for next source with token budget awareness
     pub fn should_try_next_source(content: &str) -> bool {
+        if !Self::is_truncate_filter_enabled() {
+            return false; // Don't try next source if filtering disabled
+        }
+
         let (_, remaining_tokens) = Self::get_token_budget_status();
         
         // If very low on tokens, be more selective

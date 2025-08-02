@@ -1,4 +1,4 @@
-// src/tools/bond.rs - Enhanced with BrightData SERP API and smart data sources
+// src/tools/bond.rs - Enhanced with optional filtering via TRUNCATE_FILTER env var
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
@@ -117,10 +117,15 @@ impl Tool for BondDataTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Early validation using strategy
-        let response_type = ResponseStrategy::determine_response_type("", query);
-        if matches!(response_type, ResponseType::Empty) {
-            return Ok(ResponseStrategy::create_response("", query, market, "validation", json!({}), response_type));
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, market, "validation", json!({}), response_type));
+            }
         }
 
         let execution_id = format!("bond_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
@@ -133,15 +138,39 @@ impl Tool for BondDataTool {
                 let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let source_used = result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Unknown");
                 
-                // Create appropriate response
-                let tool_result = ResponseStrategy::create_financial_response(
-                    "bond", query, market, source_used, content, result.clone()
-                );
+                // Create appropriate response based on whether filtering is enabled
+                let tool_result = if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    
+                    ResponseStrategy::create_financial_response(
+                        "bond", query, market, source_used, content, result.clone()
+                    )
+                } else {
+                    // No filtering - create standard response
+                    let mcp_content = vec![McpContent::text(format!(
+                        "🏛️ **Bond Data for: {}**\n\nMarket: {} | Bond Type: {} | Maturity: {}\nSource: {} | Time Filter: {}\n\n{}",
+                        query, market, bond_type, maturity, source_used, time_filter, content
+                    ))];
+                    ToolResult::success_with_raw(mcp_content, result)
+                };
                 
-                Ok(ResponseStrategy::apply_size_limits(tool_result))
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
             }
             Err(e) => {
-                Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                if std::env::var("TRUNCATE_FILTER")
+                    .map(|v| v.to_lowercase() == "true")
+                    .unwrap_or(false) {
+                    Ok(ResponseStrategy::create_error_response(query, &e.to_string()))
+                } else {
+                    Err(e)
+                }
             }
         }
     }
@@ -170,11 +199,22 @@ impl BondDataTool {
                         Ok(mut result) => {
                             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                             
-                            if !ResponseStrategy::should_try_next_source(content) {
-                                result["source_used"] = json!(source_name);
-                                result["data_source_type"] = json!("direct");
-                                return Ok(result);
+                            // Use strategy to determine if we should try next source only if filtering enabled
+                            if std::env::var("TRUNCATE_FILTER")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false) {
+                                
+                                if ResponseStrategy::should_try_next_source(content) {
+                                    last_error = Some(BrightDataError::ToolError(format!(
+                                        "{} returned low-quality content", source_name
+                                    )));
+                                    continue;
+                                }
                             }
+                            
+                            result["source_used"] = json!(source_name);
+                            result["data_source_type"] = json!("direct");
+                            return Ok(result);
                         }
                         Err(e) => last_error = Some(e),
                     }
@@ -187,11 +227,21 @@ impl BondDataTool {
                         Ok(mut result) => {
                             let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                             
-                            if !ResponseStrategy::should_try_next_source(content) {
-                                result["source_used"] = json!(source_name);
-                                result["data_source_type"] = json!("search");
-                                return Ok(result);
+                            if std::env::var("TRUNCATE_FILTER")
+                                .map(|v| v.to_lowercase() == "true")
+                                .unwrap_or(false) {
+                                
+                                if ResponseStrategy::should_try_next_source(content) {
+                                    last_error = Some(BrightDataError::ToolError(format!(
+                                        "{} returned low-quality content", source_name
+                                    )));
+                                    continue;
+                                }
                             }
+                            
+                            result["source_used"] = json!(source_name);
+                            result["data_source_type"] = json!("search");
+                            return Ok(result);
                         }
                         Err(e) => last_error = Some(e),
                     }
@@ -369,11 +419,18 @@ impl BondDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters
-        let filtered_content = if ResponseFilter::is_error_page(&raw_content) {
-            return Err(BrightDataError::ToolError(format!("{} returned error page", source_name)));
+        // Apply filters conditionally based on environment variable
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError(format!("{} returned error page", source_name)));
+            } else {
+                ResponseFilter::filter_financial_content(&raw_content)
+            }
         } else {
-            ResponseFilter::filter_financial_content(&raw_content)
+            raw_content.clone()
         };
 
         Ok(json!({
@@ -511,11 +568,18 @@ impl BondDataTool {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
-        // Apply filters
-        let filtered_content = if ResponseFilter::is_error_page(&raw_content) {
-            return Err(BrightDataError::ToolError(format!("{} search returned error page", source_name)));
+        // Apply filters conditionally
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError(format!("{} search returned error page", source_name)));
+            } else {
+                ResponseFilter::filter_financial_content(&raw_content)
+            }
         } else {
-            ResponseFilter::filter_financial_content(&raw_content)
+            raw_content.clone()
         };
 
         Ok(json!({

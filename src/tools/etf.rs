@@ -1,7 +1,8 @@
-// src/tools/etf.rs - Enhanced with BrightData SERP API parameters
+// src/tools/etf.rs - Enhanced with BrightData SERP API parameters and optional filtering
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::logger::JSON_LOGGER;
+use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -121,6 +122,17 @@ impl Tool for ETFDataTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        // Early validation using strategy only if TRUNCATE_FILTER is enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            let response_type = ResponseStrategy::determine_response_type("", query);
+            if matches!(response_type, ResponseType::Empty) {
+                return Ok(ResponseStrategy::create_response("", query, market, "validation", json!({}), response_type));
+            }
+        }
+
         let execution_id = format!("etf_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
         
         let result = if use_serp_api {
@@ -131,32 +143,58 @@ impl Tool for ETFDataTool {
             self.fetch_etf_data_legacy(query, market, &execution_id).await?
         };
 
-        let content_text = result.get("content").and_then(|c| c.as_str()).unwrap_or("No ETF data found");
-        
-        let mcp_content = if use_serp_api {
-            vec![McpContent::text(format!(
-                "📊 **Enhanced ETF Data for {}**\n\nMarket: {} | ETF Type: {} | Data Points: {:?}\nPage: {} | Results: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
-                query,
-                market.to_uppercase(),
-                etf_type,
-                data_points,
-                page,
-                num_results,
-                time_filter,
-                execution_id,
-                content_text
-            ))]
+        let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        let source_used = if use_serp_api { "Enhanced SERP" } else { "Legacy" };
+
+        // Create appropriate response based on whether filtering is enabled
+        let tool_result = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            ResponseStrategy::create_financial_response(
+                "etf", query, market, source_used, content, result.clone()
+            )
         } else {
-            vec![McpContent::text(format!(
-                "📊 **ETF Data for {}**\n\nMarket: {}\nExecution ID: {}\n\n{}",
-                query,
-                market.to_uppercase(),
-                execution_id,
-                content_text
-            ))]
+            // No filtering - create standard response
+            let content_text = if use_serp_api {
+                result.get("formatted_content").and_then(|c| c.as_str()).unwrap_or(content)
+            } else {
+                content
+            };
+            
+            let mcp_content = if use_serp_api {
+                vec![McpContent::text(format!(
+                    "📊 **Enhanced ETF Data for {}**\n\nMarket: {} | ETF Type: {} | Data Points: {:?}\nPage: {} | Results: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
+                    query,
+                    market.to_uppercase(),
+                    etf_type,
+                    data_points,
+                    page,
+                    num_results,
+                    time_filter,
+                    execution_id,
+                    content_text
+                ))]
+            } else {
+                vec![McpContent::text(format!(
+                    "📊 **ETF Data for {}**\n\nMarket: {}\nExecution ID: {}\n\n{}",
+                    query,
+                    market.to_uppercase(),
+                    execution_id,
+                    content_text
+                ))]
+            };
+            ToolResult::success_with_raw(mcp_content, result)
         };
 
-        Ok(ToolResult::success_with_raw(mcp_content, result))
+        // Apply size limits only if filtering enabled
+        if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            Ok(ResponseStrategy::apply_size_limits(tool_result))
+        } else {
+            Ok(tool_result)
+        }
     }
 }
 
@@ -276,14 +314,31 @@ impl ETFDataTool {
             )));
         }
 
-        let content = response.text().await
+        let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
+        // Apply filters conditionally based on environment variable
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError("Enhanced ETF search returned error page".into()));
+            } else if ResponseStrategy::should_try_next_source(&raw_content) {
+                return Err(BrightDataError::ToolError("Content quality too low".into()));
+            } else {
+                ResponseFilter::filter_financial_content(&raw_content)
+            }
+        } else {
+            raw_content.clone()
+        };
+
         // Format the results
-        let formatted_content = self.format_etf_results(&content, query, market, etf_type, data_points, page, num_results);
+        let formatted_content = self.format_etf_results(&filtered_content, query, market, etf_type, data_points, page, num_results);
 
         Ok(json!({
-            "content": formatted_content,
+            "content": filtered_content,
+            "formatted_content": formatted_content,
             "query": query,
             "search_query": search_query,
             "market": market,
@@ -294,7 +349,7 @@ impl ETFDataTool {
             "time_filter": time_filter,
             "zone": zone,
             "execution_id": execution_id,
-            "raw_response": content,
+            "raw_response": raw_content,
             "success": true,
             "api_type": "enhanced_serp"
         }))
@@ -367,11 +422,25 @@ impl ETFDataTool {
             )));
         }
 
-        let content = response.text().await
+        let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
+        // Apply filters conditionally
+        let filtered_content = if std::env::var("TRUNCATE_FILTER")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false) {
+            
+            if ResponseFilter::is_error_page(&raw_content) {
+                return Err(BrightDataError::ToolError("ETF search returned error page".into()));
+            } else {
+                ResponseFilter::filter_financial_content(&raw_content)
+            }
+        } else {
+            raw_content.clone()
+        };
+
         Ok(json!({
-            "content": content,
+            "content": filtered_content,
             "query": query,
             "market": market,
             "execution_id": execution_id,
