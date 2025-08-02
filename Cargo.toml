@@ -1,6 +1,6 @@
 [package]
 name = "snm-brightdata-client"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "Bright Data MCP Client implemented in Rust with Actix Web"
 authors = ["Inx Maurya <you@example.com>"]
