@@ -844,7 +844,7 @@ impl StockDataTool {
                             ));
                             if urls.len() < max_sources {
                                 urls.push((
-                                    format!("https://www.moneycontrol.com/india/stockpricequote/{}", urlencoding::encode(query)),
+                                    format!("https://finance.yahoo.com/quote/{}.NS/", urlencoding::encode(query)),
                                     "MoneyControl".to_string()
                                 ));
                             }
