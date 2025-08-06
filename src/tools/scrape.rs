@@ -1,7 +1,7 @@
 // src/tools/scrape.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
-use crate::logger::JSON_LOGGER;
+use crate::extras::logger::JSON_LOGGER;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -83,11 +83,26 @@ impl Tool for ScrapeMarkdown {
         })
     }
 
+    // FIXED: Remove the execute method override to use the default one with metrics logging
+    // async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+    //     self.execute_internal(parameters).await
+    // }
+
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let url = parameters
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'url' parameter".into()))?;
+        
+        // Validate URL is not empty and is properly formatted
+        if url.trim().is_empty() {
+            return Err(BrightDataError::ToolError("URL cannot be empty".into()));
+        }
+        
+        // Basic URL validation
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(BrightDataError::ToolError("URL must start with http:// or https://".into()));
+        }
 
         let method = parameters
             .get("method")
@@ -144,11 +159,6 @@ impl Tool for ScrapeMarkdown {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
             
-            let response_type = ResponseStrategy::determine_response_type("", url);
-            if matches!(response_type, ResponseType::Empty) {
-                return Ok(ResponseStrategy::create_response("", url, "scrape", "validation", json!({}), response_type));
-            }
-
             // Budget check for scrape queries
             let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
             if remaining_tokens < 150 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
@@ -329,13 +339,13 @@ impl ScrapeMarkdown {
         }
 
         // Add priority processing hints
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            payload["processing_priority"] = json!(format!("{:?}", priority));
-            payload["token_budget"] = json!(token_budget);
-        }
+        // (No undocumented fields should be added to the payload)
+        // if std::env::var("TRUNCATE_FILTER")
+        //     .map(|v| v.to_lowercase() == "true")
+        //     .unwrap_or(false) {
+        //     // Only add token_budget if it's a documented/accepted field
+        //     payload["token_budget"] = json!(token_budget);
+        // }
 
         let client = Client::builder().timeout(Duration::from_secs(120)).build()
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
@@ -582,23 +592,52 @@ impl ScrapeMarkdown {
         let raw_content = response.text().await
             .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
 
+        // Check if response is empty or contains error
+        if raw_content.trim().is_empty() {
+            return Err(BrightDataError::ToolError(format!(
+                "{} returned empty response", service_type
+            )));
+        }
+
+        // Parse the response to check for BrightData API errors
+        let content_to_process = if let Ok(response_json) = serde_json::from_str::<Value>(&raw_content) {
+            if let Some(error) = response_json.get("error") {
+                return Err(BrightDataError::ToolError(format!(
+                    "{} returned API error: {}", service_type, error
+                )));
+            }
+            
+            // Check if response contains the expected data
+            if let Some(data) = response_json.get("data") {
+                if let Some(content) = data.as_str() {
+                    content.to_string()
+                } else {
+                    raw_content
+                }
+            } else {
+                raw_content
+            }
+        } else {
+            raw_content
+        };
+
         // Apply filters conditionally based on environment variable with priority awareness
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
             
-            if ResponseFilter::is_error_page(&raw_content) {
+            if ResponseFilter::is_error_page(&content_to_process) {
                 return Err(BrightDataError::ToolError(format!("{} returned error page", service_type)));
-            } else if ResponseStrategy::should_try_next_source(&raw_content) {
+            } else if ResponseStrategy::should_try_next_source(&content_to_process) {
                 return Err(BrightDataError::ToolError("Content quality too low".into()));
             }
         }
 
-        let processed_content = self.post_process_content_with_priority(&raw_content, format, priority, token_budget);
+        let processed_content = self.post_process_content_with_priority(&content_to_process, format, priority, token_budget);
 
         Ok(json!({
             "content": processed_content,
-            "raw_content": raw_content,
+            "raw_content": content_to_process,
             "service": service_type,
             "service_name": service_name,
             "priority": format!("{:?}", priority),

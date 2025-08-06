@@ -1,7 +1,7 @@
 // src/tool.rs - Fixed version with compilation errors resolved
 use async_trait::async_trait;
 use crate::error::BrightDataError;
-use crate::logger::{JSON_LOGGER, ExecutionLog};
+use crate::extras::logger::{JSON_LOGGER, ExecutionLog};
 use crate::metrics::{BRIGHTDATA_METRICS, EnhancedLogger};
 use serde_json::Value;
 use serde::{Deserialize, Serialize};
@@ -494,7 +494,6 @@ impl ToolResolver {
             "get_bond_data" => Some(Box::new(crate::tools::bond::BondDataTool)),
             "get_mutual_fund_data" => Some(Box::new(crate::tools::mutual_fund::MutualFundDataTool)),
             "get_commodity_data" => Some(Box::new(crate::tools::commodity::CommodityDataTool)),
-            "get_market_overview" => Some(Box::new(crate::tools::market::MarketOverviewTool)),
             
             // Additional tools if needed
             "multi_zone_search" => Some(Box::new(crate::tools::multi_zone_search::MultiZoneSearch)),
@@ -574,39 +573,39 @@ impl ToolResolver {
                     "required": ["url"]
                 }
             }),
-            serde_json::json!({
-                "name": "take_screenshot",
-                "description": "Take a screenshot of a webpage using BrightData Browser",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to screenshot"
-                        },
-                        "width": {
-                            "type": "integer",
-                            "description": "Screenshot width",
-                            "default": 1280,
-                            "minimum": 320,
-                            "maximum": 1920
-                        },
-                        "height": {
-                            "type": "integer",
-                            "description": "Screenshot height",
-                            "default": 720,
-                            "minimum": 240,
-                            "maximum": 1080
-                        },
-                        "full_page": {
-                            "type": "boolean",
-                            "description": "Capture full page height",
-                            "default": false
-                        }
-                    },
-                    "required": ["url"]
-                }
-            }),
+            // serde_json::json!({
+            //     "name": "take_screenshot",
+            //     "description": "Take a screenshot of a webpage using BrightData Browser",
+            //     "inputSchema": {
+            //         "type": "object",
+            //         "properties": {
+            //             "url": {
+            //                 "type": "string",
+            //                 "description": "The URL to screenshot"
+            //             },
+            //             "width": {
+            //                 "type": "integer",
+            //                 "description": "Screenshot width",
+            //                 "default": 1280,
+            //                 "minimum": 320,
+            //                 "maximum": 1920
+            //             },
+            //             "height": {
+            //                 "type": "integer",
+            //                 "description": "Screenshot height",
+            //                 "default": 720,
+            //                 "minimum": 240,
+            //                 "maximum": 1080
+            //             },
+            //             "full_page": {
+            //                 "type": "boolean",
+            //                 "description": "Capture full page height",
+            //                 "default": false
+            //             }
+            //         },
+            //         "required": ["url"]
+            //     }
+            // }),
 
             // Financial tools
             serde_json::json!({
@@ -615,7 +614,7 @@ impl ToolResolver {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { 
+                        "query": {
                             "type": "string", 
                             "description": "Stock symbol (e.g. ASHOKLEY, TCS, AAPL), company name, comparison query (AAPL vs MSFT), or market overview request (today's stock performance, Nifty 50 performance)" 
                         },
@@ -713,49 +712,28 @@ impl ToolResolver {
                     },
                     "required": ["query"]
                 }
-            }),
-            serde_json::json!({
-                "name": "get_market_overview",
-                "description": "Get comprehensive market overview including major indices, sector performance, market sentiment, and overall market trends",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "market_type": { 
-                            "type": "string", 
-                            "enum": ["stocks", "crypto", "bonds", "commodities", "overall"], 
-                            "default": "overall",
-                            "description": "Type of market overview - overall for general market, or specific asset class"
-                        },
-                        "region": { 
-                            "type": "string", 
-                            "enum": ["indian", "us", "global"], 
-                            "default": "indian"
-                        }
-                    },
-                    "required": []
-                }
-            }),
-            serde_json::json!({
-                "name": "multi_zone_search",
-                "description": "Performs the same search query across multiple BrightData zones in parallel",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { "type": "string" },
-                        "engine": {
-                            "type": "string",
-                            "enum": ["google", "bing", "yandex", "duckduckgo"],
-                            "default": "google"
-                        },
-                        "zones": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "List of BrightData zone names to run parallel searches"
-                        }
-                    },
-                    "required": ["query", "zones"]
-                }
             })
+            // serde_json::json!({
+            //     "name": "multi_zone_search",
+            //     "description": "Performs the same search query across multiple BrightData zones in parallel",
+            //     "inputSchema": {
+            //         "type": "object",
+            //         "properties": {
+            //             "query": { "type": "string" },
+            //             "engine": {
+            //                 "type": "string",
+            //                 "enum": ["google", "bing", "yandex", "duckduckgo"],
+            //                 "default": "google"
+            //             },
+            //             "zones": {
+            //                 "type": "array",
+            //                 "items": { "type": "string" },
+            //                 "description": "List of BrightData zone names to run parallel searches"
+            //             }
+            //         },
+            //         "required": ["query", "zones"]
+            //     }
+            // })
         ]
     }
 
@@ -765,15 +743,14 @@ impl ToolResolver {
             "scrape_website",
             "search_web", 
             "extract_data",
-            "take_screenshot",
+            // "take_screenshot",
             "get_stock_data",
             "get_crypto_data",
             "get_etf_data",
             "get_bond_data",
             "get_mutual_fund_data",
             "get_commodity_data",
-            "get_market_overview",
-            "multi_zone_search"
+            // "multi_zone_search"
         ]
     }
 

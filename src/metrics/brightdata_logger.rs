@@ -1,4 +1,4 @@
-// src/metrics/brightdata_logger.rs - Complete version with MCP session support
+// src/metrics/brightdata_logger.rs - Complete fixed version with proper path handling
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ pub enum BrightDataService {
     Browse, 
     SERP,
     WebUnlocker,
-    McpSession, // New: for MCP session events
+    McpSession,
 }
 
 impl From<&str> for BrightDataService {
@@ -38,7 +38,7 @@ pub enum DataFormat {
     JSON,
     HTML,
     Screenshot,
-    SessionEvent, // New: for MCP session events
+    SessionEvent,
     Unknown(String),
 }
 
@@ -77,10 +77,11 @@ pub struct BrightDataCall {
     pub service: BrightDataService,
     pub sequence_number: u64,
     pub anthropic_request_id: Option<String>,
-    pub mcp_session_id: Option<String>, // New: track MCP session
+    pub mcp_session_id: Option<String>,
     
     // Request details
     pub url: String,
+    pub query: Option<String>,
     pub config: BrightDataConfig,
     
     // Response details
@@ -91,6 +92,10 @@ pub struct BrightDataCall {
     pub filtered_data_size_kb: f64,
     pub truncated: bool,
     pub truncation_reason: Option<String>,
+    
+    // Response data content
+    pub raw_response_data: Option<String>,
+    pub filtered_response_data: Option<String>,
     
     // Performance
     pub duration_ms: u64,
@@ -117,27 +122,56 @@ pub struct ServiceMetrics {
     pub average_duration_ms: f64,
     pub most_used_format: DataFormat,
     pub most_used_zone: String,
-    pub truncation_rate: f64, // Percentage of calls that were truncated
-    pub unique_sessions: u64, // New: number of unique MCP sessions
+    pub truncation_rate: f64,
+    pub unique_sessions: u64,
 }
 
-/// Main metrics logger with MCP session support
+/// Main metrics logger with MCP session support and FIXED path handling
 pub struct BrightDataMetricsLogger {
     call_counter: AtomicU64,
     calls: Arc<Mutex<Vec<BrightDataCall>>>,
     service_counters: Arc<Mutex<HashMap<BrightDataService, AtomicU64>>>,
-    session_counters: Arc<Mutex<HashMap<String, AtomicU64>>>, // New: per-session counters
+    session_counters: Arc<Mutex<HashMap<String, AtomicU64>>>,
     log_file_path: String,
 }
 
 impl BrightDataMetricsLogger {
     pub fn new(log_file_path: &str) -> Self {
+        // FIXED: Ensure proper file path, not directory path
+        let path = std::path::Path::new(log_file_path);
+        
+        // Create parent directories if they don't exist
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("Warning: Failed to create log directory {:?}: {}", parent, e);
+            }
+        }
+        
+        // FIXED: Ensure the path points to a file, not a directory
+        let final_path = if path.is_dir() || log_file_path.ends_with('/') || log_file_path.ends_with('\\') {
+            // If it's a directory, append default filename
+            let dir_path = if log_file_path.ends_with('/') || log_file_path.ends_with('\\') {
+                log_file_path.trim_end_matches('/').trim_end_matches('\\')
+            } else {
+                log_file_path
+            };
+            format!("{}/brightdata_metrics.jsonl", dir_path)
+        } else if !log_file_path.contains('.') {
+            // If no extension, add .jsonl
+            format!("{}.jsonl", log_file_path)
+        } else {
+            // Already a proper file path
+            log_file_path.to_string()
+        };
+        
+        println!("📊 BrightData metrics logger initialized with file: {}", final_path);
+        
         Self {
             call_counter: AtomicU64::new(0),
             calls: Arc::new(Mutex::new(Vec::new())),
             service_counters: Arc::new(Mutex::new(HashMap::new())),
-            session_counters: Arc::new(Mutex::new(HashMap::new())), // New
-            log_file_path: log_file_path.to_string(),
+            session_counters: Arc::new(Mutex::new(HashMap::new())),
+            log_file_path: final_path,
         }
     }
     
@@ -156,7 +190,7 @@ impl BrightDataMetricsLogger {
         filtered_content: Option<&str>,
         duration_ms: u64,
         anthropic_request_id: Option<&str>,
-        mcp_session_id: Option<&str>, // New parameter
+        mcp_session_id: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let sequence = self.call_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let service = BrightDataService::from(zone);
@@ -169,11 +203,30 @@ impl BrightDataMetricsLogger {
                 .fetch_add(1, Ordering::SeqCst);
         }
         
-        // Analyze content
-        let content_quality_score = crate::filters::ResponseFilter::get_content_quality_score(raw_content);
-        let contains_financial_data = crate::filters::ResponseFilter::contains_financial_data(raw_content);
-        let is_navigation_heavy = crate::filters::ResponseFilter::is_mostly_navigation(raw_content);
-        let is_error_page = crate::filters::ResponseFilter::is_error_page(raw_content);
+        // Analyze content safely
+        let content_quality_score = if raw_content.len() > 0 {
+            crate::filters::ResponseFilter::get_content_quality_score(raw_content)
+        } else {
+            0
+        };
+        
+        let contains_financial_data = if raw_content.len() > 0 {
+            crate::filters::ResponseFilter::contains_financial_data(raw_content)
+        } else {
+            false
+        };
+        
+        let is_navigation_heavy = if raw_content.len() > 0 {
+            crate::filters::ResponseFilter::is_mostly_navigation(raw_content)
+        } else {
+            false
+        };
+        
+        let is_error_page = if raw_content.len() > 0 {
+            crate::filters::ResponseFilter::is_error_page(raw_content)
+        } else {
+            status_code >= 400
+        };
         
         // Calculate sizes
         let raw_data_size_kb = raw_content.len() as f64 / 1024.0;
@@ -204,9 +257,9 @@ impl BrightDataMetricsLogger {
             zone: zone.to_string(),
             format: format.to_string(),
             data_format: data_format.map(|s| s.to_string()),
-            timeout_seconds: 90, // Default, could be extracted from client config
+            timeout_seconds: 90,
             viewport: payload.get("viewport").cloned(),
-            custom_headers: None, // Could be extracted from request
+            custom_headers: None,
             full_page: payload.get("full_page").and_then(|v| v.as_bool()),
         };
         
@@ -216,9 +269,17 @@ impl BrightDataMetricsLogger {
             service: service.clone(),
             sequence_number: sequence,
             anthropic_request_id: anthropic_request_id.map(|s| s.to_string()),
-            mcp_session_id: mcp_session_id.map(|s| s.to_string()), // New field
+            mcp_session_id: mcp_session_id.map(|s| s.to_string()),
             
             url: url.to_string(),
+            query: payload.get("query").and_then(|v| v.as_str()).map(|s| s.to_string())
+                .or_else(|| {
+                    if url.contains("search?") || url.contains("quote/") {
+                        url.split('/').last().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                }),
             config,
             
             status_code,
@@ -228,6 +289,9 @@ impl BrightDataMetricsLogger {
             filtered_data_size_kb,
             truncated,
             truncation_reason,
+            
+            raw_response_data: Some(raw_content.to_string()),
+            filtered_response_data: filtered_content.map(|s| s.to_string()),
             
             duration_ms,
             success: status_code >= 200 && status_code < 400,
@@ -256,8 +320,11 @@ impl BrightDataMetricsLogger {
                 .fetch_add(1, Ordering::SeqCst);
         }
         
-        // Write to log file
-        self.write_call_to_log(&call).await?;
+        // FIXED: Write to log file with proper error handling
+        if let Err(e) = self.write_call_to_log(&call).await {
+            eprintln!("Warning: Failed to write to metrics log file '{}': {}", self.log_file_path, e);
+            // Don't return error, just log warning
+        }
         
         Ok(())
     }
@@ -270,7 +337,7 @@ impl BrightDataMetricsLogger {
             .unwrap_or(0)
     }
     
-    /// Get total call count (by Anthropic)
+    /// Get total call count
     pub fn get_total_call_count(&self) -> u64 {
         self.call_counter.load(Ordering::SeqCst)
     }
@@ -318,7 +385,7 @@ impl BrightDataMetricsLogger {
                 most_used_format: DataFormat::Raw,
                 most_used_zone: String::new(),
                 truncation_rate: 0.0,
-                unique_sessions: 0, // New field
+                unique_sessions: 0,
             });
             
             entry.total_calls += 1;
@@ -337,7 +404,6 @@ impl BrightDataMetricsLogger {
                 metric.average_data_size_kb = metric.total_data_kb / metric.total_calls as f64;
                 metric.average_duration_ms = metric.total_duration_ms as f64 / metric.total_calls as f64;
                 
-                // Find most used format and zone for this service
                 let service_calls: Vec<_> = calls.iter()
                     .filter(|c| &c.service == service)
                     .collect();
@@ -353,7 +419,6 @@ impl BrightDataMetricsLogger {
                     if call.truncated {
                         truncated_count += 1;
                     }
-                    // Track unique sessions
                     if let Some(session_id) = &call.mcp_session_id {
                         unique_sessions.insert(session_id.clone());
                     }
@@ -382,17 +447,15 @@ impl BrightDataMetricsLogger {
         calls
     }
     
-    /// Reset metrics for new MCP session (optional - keeps history but marks new session)
+    /// Mark new MCP session
     pub async fn mark_new_session(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log::info!("📊 Marking new MCP session: {}", session_id);
         
-        // Initialize session counter
         {
             let mut session_counters = self.session_counters.lock().unwrap();
             session_counters.insert(session_id.to_string(), AtomicU64::new(0));
         }
         
-        // Log session marker
         self.log_call(
             &format!("session_marker_{}", session_id),
             &format!("mcp://session/{}", session_id),
@@ -416,8 +479,13 @@ impl BrightDataMetricsLogger {
         Ok(())
     }
     
-    /// Write individual call to log file
+    /// FIXED: Write individual call to log file with proper error handling
     async fn write_call_to_log(&self, call: &BrightDataCall) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&self.log_file_path).parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -431,7 +499,7 @@ impl BrightDataMetricsLogger {
         Ok(())
     }
     
-    /// Generate comprehensive metrics report with session breakdown
+    /// Generate comprehensive metrics report
     pub async fn generate_metrics_report(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let service_metrics = self.get_service_metrics();
         let total_calls = self.get_total_call_count();
@@ -441,10 +509,9 @@ impl BrightDataMetricsLogger {
         let mut report = String::new();
         report.push_str("# BrightData Metrics Report\n\n");
         report.push_str(&format!("Generated: {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
-        report.push_str(&format!("Total Calls by Anthropic: {}\n", total_calls));
+        report.push_str(&format!("Total Calls: {}\n", total_calls));
         report.push_str(&format!("Total MCP Sessions: {}\n\n", all_sessions.len()));
         
-        // MCP Session breakdown
         if !all_sessions.is_empty() {
             report.push_str("## MCP Session Breakdown\n\n");
             for (session_id, call_count) in all_sessions.iter() {
@@ -453,7 +520,6 @@ impl BrightDataMetricsLogger {
             report.push_str("\n");
         }
         
-        // Service breakdown
         report.push_str("## Service Breakdown\n\n");
         for (service, metrics) in service_metrics.iter() {
             report.push_str(&format!("### {:?}\n", service));
@@ -468,7 +534,6 @@ impl BrightDataMetricsLogger {
             report.push_str("\n");
         }
         
-        // Call sequence
         report.push_str("## Call Sequence\n\n");
         for (i, call) in calls_by_sequence.iter().enumerate() {
             let session_info = call.mcp_session_id.as_deref().unwrap_or("no-session");
@@ -487,8 +552,24 @@ impl BrightDataMetricsLogger {
     }
 }
 
-// Global instance
+// FIXED: Global instance with proper path handling
 lazy_static::lazy_static! {
-    pub static ref BRIGHTDATA_METRICS: BrightDataMetricsLogger = 
-        BrightDataMetricsLogger::new("logs/brightdata_metrics.jsonl");
+    pub static ref BRIGHTDATA_METRICS: BrightDataMetricsLogger = {
+        let log_path = std::env::var("BRIGHTDATA_METRICS_LOG_PATH")
+            .unwrap_or_else(|_| "logs/brightdata_metrics.jsonl".to_string());
+        
+        // Ensure we have a proper file path, not a directory
+        let final_path = if log_path.ends_with('/') || log_path.ends_with('\\') {
+            format!("{}brightdata_metrics.jsonl", log_path)
+        } else if std::path::Path::new(&log_path).is_dir() {
+            format!("{}/brightdata_metrics.jsonl", log_path)
+        } else if !log_path.contains('.') {
+            format!("{}.jsonl", log_path)
+        } else {
+            log_path
+        };
+        
+        println!("📊 Initializing BrightData metrics with file: {}", final_path);
+        BrightDataMetricsLogger::new(&final_path)
+    };
 }

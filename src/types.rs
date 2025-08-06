@@ -1,4 +1,4 @@
-// src/types.rs - Complete version with existing + MCP types
+// src/types.rs - Fixed version with proper JSON-RPC field names
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -30,11 +30,10 @@ pub struct ToolError {
     pub message: String,
 }
 
-// NEW MCP PROTOCOL TYPES (added)
+// MCP PROTOCOL TYPES (fixed field names)
 #[derive(Debug, Deserialize)]
 pub struct McpRequest {
-    #[serde(rename = "jsonrpc")]
-    pub json_rpc: String,
+    pub jsonrpc: String, // Fixed: Use jsonrpc instead of json_rpc
     pub id: Option<Value>,
     pub method: String,
     pub params: Option<Value>,

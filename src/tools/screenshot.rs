@@ -1,7 +1,7 @@
 // src/tools/screenshot.rs - Enhanced with browser parameters and smart device selection
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
-use crate::logger::JSON_LOGGER;
+use crate::extras::logger::JSON_LOGGER;
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use reqwest::Client;
@@ -93,6 +93,11 @@ impl Tool for ScreenshotTool {
             "required": ["url"]
         })
     }
+
+    // FIXED: Remove the execute method override to use the default one with metrics logging
+    // async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+    //     self.execute_internal(parameters).await
+    // }
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let url = parameters

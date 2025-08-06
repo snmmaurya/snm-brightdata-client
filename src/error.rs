@@ -1,4 +1,4 @@
-// src/error.rs
+// src/error.rs - Enhanced version with additional error types
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -35,4 +35,19 @@ pub enum BrightDataError {
 
     #[error("Tool not found: {0}")]
     ToolNotFound(String),
+
+    #[error("Rate limit exceeded: {0}")]
+    RateLimitExceeded(String),
+
+    #[error("Authentication failed: {0}")]
+    AuthenticationFailed(String),
+
+    #[error("Zone not found: {0}")]
+    ZoneNotFound(String),
+
+    #[error("Timeout error: {0}")]
+    Timeout(String),
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
 }

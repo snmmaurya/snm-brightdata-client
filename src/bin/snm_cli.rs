@@ -1,9 +1,10 @@
-// src/bin/snm_cli.rs
+// src/bin/snm_cli.rs - Cleaned up version
 use snm_brightdata_client::tools::{scrape::ScrapeMarkdown, search::SearchEngine, extract::Extractor, screenshot::ScreenshotTool};
 use snm_brightdata_client::tool::{Tool, ToolResult};
 use snm_brightdata_client::error::BrightDataError;
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use dotenv::dotenv;
 
 #[derive(Parser)]
 #[command(name = "snm-cli")]
@@ -15,21 +16,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Scrape a website and extract content
     Scrape { 
         url: String,
         #[arg(short, long, default_value = "markdown")]
         format: String,
     },
+    /// Search the web using various engines
     Search { 
         query: String,
         #[arg(short, long, default_value = "google")]
         engine: String,
     },
+    /// Extract structured data from a webpage
     Extract { 
         url: String,
         #[arg(short, long, default_value = "json")]
         format: String,
     },
+    /// Take a screenshot of a webpage
     Screenshot {
         url: String,
         #[arg(short, long, default_value_t = 1280)]
@@ -43,6 +48,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    // Load environment variables
+    dotenv().ok();
+    env_logger::init();
+
     let cli = Cli::parse();
     match cli.command {
         Commands::Scrape { url, format } => {
@@ -82,7 +91,7 @@ fn handle_result(result: Result<ToolResult, BrightDataError>) {
         Ok(tool_result) => {
             println!("✅ Tool execution successful!");
             
-            // Display MCP content
+            // Display content
             for (i, content) in tool_result.content.iter().enumerate() {
                 match content.content_type.as_str() {
                     "text" => {
@@ -99,7 +108,6 @@ fn handle_result(result: Result<ToolResult, BrightDataError>) {
                         }
                         if let Some(data) = &content.data {
                             println!("Image Data Length: {} characters", data.len());
-                            println!("Image Data (first 100 chars): {}...", &data[..100.min(data.len())]);
                         }
                     },
                     _ => {
@@ -107,12 +115,6 @@ fn handle_result(result: Result<ToolResult, BrightDataError>) {
                         println!("{}", content.text);
                     }
                 }
-            }
-            
-            // Display raw data if available (for debugging/development)
-            if let Some(raw_value) = &tool_result.raw_value {
-                println!("\n🔧 Raw Response Data:");
-                println!("{:#}", raw_value);
             }
             
             // Show error status if present

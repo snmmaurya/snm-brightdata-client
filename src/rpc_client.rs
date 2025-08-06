@@ -1,5 +1,4 @@
 // src/rpc_client.rs - Cleaned up to use ToolResolver
-use crate::types::{ToolCallRequest, ToolCallResponse};
 use crate::error::BrightDataError;
 use crate::tool::ToolResolver;
 use serde_json::Value;

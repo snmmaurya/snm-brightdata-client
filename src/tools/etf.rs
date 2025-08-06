@@ -1,7 +1,7 @@
 // src/tools/etf.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
-use crate::logger::JSON_LOGGER;
+use crate::extras::logger::JSON_LOGGER;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -80,6 +80,11 @@ impl Tool for ETFDataTool {
         })
     }
 
+    // FIXED: Remove the execute method override to use the default one with metrics logging
+    // async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+    //     self.execute_internal(parameters).await
+    // }
+
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let query = parameters
             .get("query")
@@ -131,15 +136,10 @@ impl Tool for ETFDataTool {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
             
-            let response_type = ResponseStrategy::determine_response_type("", query);
-            if matches!(response_type, ResponseType::Empty) {
-                return Ok(ResponseStrategy::create_response("", query, market, "validation", json!({}), response_type));
-            }
-
             // Budget check for ETF queries
             let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
-            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
-                return Ok(ResponseStrategy::create_response("", query, market, "budget_limit", json!({}), ResponseType::Skip));
+            if remaining_tokens < 150 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
+                return Ok(ResponseStrategy::create_response("", query, "etf", "budget_limit", json!({}), ResponseType::Skip));
             }
         }
 
@@ -580,7 +580,7 @@ impl ETFDataTool {
     }
 
     // ENHANCED: Priority-aware result formatting
-    fn format_etf_results_with_priority(&self, content: &str, query: &str, market: &str, etf_type: &str, data_points: &[&str], page: u32, num_results: u32, priority: crate::filters::strategy::QueryPriority) -> String {
+    fn format_etf_results_with_priority(&self, content: &str, query: &str, market: &str, etf_type: &str, data_points: &[&str], page: u32, num_results: u32, _priority: crate::filters::strategy::QueryPriority) -> String {
         // Check if we need compact formatting
         if std::env::var("TRUNCATE_FILTER")
             .map(|v| v.to_lowercase() == "true")

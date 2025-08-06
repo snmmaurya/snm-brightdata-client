@@ -150,22 +150,94 @@ pub async fn generate_text_report() -> Result<String, Box<dyn std::error::Error 
 pub fn get_metrics_summary() -> Value {
     let total_calls = BRIGHTDATA_METRICS.get_total_call_count();
     let service_metrics = BRIGHTDATA_METRICS.get_service_metrics();
+    let calls = BRIGHTDATA_METRICS.get_calls_by_sequence();
     
     let mut total_data_kb = 0.0;
     let mut total_filtered_kb = 0.0;
     let mut total_successful = 0;
-    // FIXED: Remove unused variable warning
-    let _total_failed = 0;
+    let mut total_tokens_estimated = 0.0;
+    let mut total_duration_ms = 0;
     
+    // Calculate totals
     for (_, metrics) in service_metrics.iter() {
         total_data_kb += metrics.total_data_kb;
         total_successful += metrics.successful_calls;
-        // Don't increment total_failed since it's not used
+        total_duration_ms += metrics.total_duration_ms;
     }
     
-    let calls = BRIGHTDATA_METRICS.get_calls_by_sequence();
     for call in calls.iter() {
         total_filtered_kb += call.filtered_data_size_kb;
+        // Estimate tokens based on data size (rough approximation)
+        total_tokens_estimated += call.raw_data_size_kb * 0.75; // ~0.75 tokens per KB
+    }
+    
+    // Create detailed call summaries
+    let mut call_summaries = Vec::new();
+    for (index, call) in calls.iter().enumerate() {
+        call_summaries.push(json!({
+            "call_id": call.call_id,
+            "sequence_number": index + 1,
+            "timestamp": call.timestamp.to_rfc3339(),
+            "service": format!("{:?}", call.service),
+            "url": call.url,
+            "query": call.query,
+            "status_code": call.status_code,
+            "success": call.success,
+            "duration_ms": call.duration_ms,
+            "data_sizes": {
+                "raw_data_size_kb": call.raw_data_size_kb,
+                "filtered_data_size_kb": call.filtered_data_size_kb,
+                "truncated": call.truncated,
+                "truncation_reason": call.truncation_reason
+            },
+            "estimated_tokens": call.raw_data_size_kb * 0.75,
+            "brightdata_request": {
+                "zone": call.config.zone,
+                "format": call.config.format,
+                "data_format": call.config.data_format,
+                "timeout_seconds": call.config.timeout_seconds,
+                "viewport": call.config.viewport,
+                "custom_headers": call.config.custom_headers,
+                "full_page": call.config.full_page
+            },
+            "response_headers": call.response_headers,
+            "response_data": {
+                "raw_response_data": call.raw_response_data,
+                "filtered_response_data": call.filtered_response_data
+            },
+            "content_analysis": {
+                "quality_score": call.content_quality_score,
+                "contains_financial_data": call.contains_financial_data,
+                "is_navigation_heavy": call.is_navigation_heavy,
+                "is_error_page": call.is_error_page
+            },
+            "mcp_session_id": call.mcp_session_id,
+            "anthropic_request_id": call.anthropic_request_id,
+            "error_message": call.error_message
+        }));
+    }
+    
+    // Service breakdown
+    let mut service_breakdown = Vec::new();
+    for (service, metrics) in service_metrics.iter() {
+        service_breakdown.push(json!({
+            "service": format!("{:?}", service),
+            "total_calls": metrics.total_calls,
+            "successful_calls": metrics.successful_calls,
+            "failed_calls": metrics.failed_calls,
+            "success_rate_percent": if metrics.total_calls > 0 {
+                (metrics.successful_calls as f64 / metrics.total_calls as f64) * 100.0
+            } else {
+                0.0
+            },
+            "total_data_kb": metrics.total_data_kb,
+            "average_data_size_kb": metrics.average_data_size_kb,
+            "total_duration_ms": metrics.total_duration_ms,
+            "average_duration_ms": metrics.average_duration_ms,
+            "most_used_zone": metrics.most_used_zone,
+            "truncation_rate": metrics.truncation_rate,
+            "unique_sessions": metrics.unique_sessions
+        }));
     }
     
     json!({
@@ -183,12 +255,21 @@ pub fn get_metrics_summary() -> Value {
             } else {
                 0.0
             },
+            "total_estimated_tokens": total_tokens_estimated,
+            "total_duration_ms": total_duration_ms,
+            "average_duration_ms": if total_calls > 0 {
+                total_duration_ms as f64 / total_calls as f64
+            } else {
+                0.0
+            },
             "services_used": service_metrics.len(),
             "most_used_service": service_metrics.iter()
                 .max_by_key(|(_, m)| m.total_calls)
                 .map(|(s, _)| format!("{:?}", s))
                 .unwrap_or_else(|| "None".to_string())
         },
+        "service_breakdown": service_breakdown,
+        "call_summaries": call_summaries,
         "timestamp": chrono::Utc::now().to_rfc3339()
     })
 }

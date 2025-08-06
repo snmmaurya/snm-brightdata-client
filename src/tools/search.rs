@@ -1,7 +1,7 @@
 // src/tools/search.rs - COMPLETE PATCHED VERSION with enhanced token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
-use crate::logger::JSON_LOGGER;
+use crate::extras::logger::JSON_LOGGER;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -88,10 +88,10 @@ impl Tool for SearchEngine {
         })
     }
 
-    // FIXED: Add the missing execute method that delegates to execute_internal
-    async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
-        self.execute_internal(parameters).await
-    }
+    // FIXED: Remove the execute method override to use the default one with metrics logging
+    // async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+    //     self.execute_internal(parameters).await
+    // }
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let query = parameters
@@ -148,22 +148,8 @@ impl Tool for SearchEngine {
         let query_priority = ResponseStrategy::classify_query_priority(query);
         let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
 
-        // Early validation using strategy only if TRUNCATE_FILTER is enabled
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            let response_type = ResponseStrategy::determine_response_type("", query);
-            if matches!(response_type, ResponseType::Empty) {
-                return Ok(ResponseStrategy::create_response("", query, "search", "validation", json!({}), response_type));
-            }
-
-            // Budget check for search queries
-            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
-            if remaining_tokens < 100 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
-                return Ok(ResponseStrategy::create_response("", query, "search", "budget_limit", json!({}), ResponseType::Skip));
-            }
-        }
+        // REMOVED: Early validation that was causing "Query required" responses
+        // The tool should make the actual API call instead of early validation
 
         let execution_id = self.generate_execution_id();
         
@@ -488,14 +474,7 @@ impl SearchEngine {
             "data_format": "markdown"
         });
 
-        // Add priority processing hints
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            payload["processing_priority"] = json!(format!("{:?}", priority));
-            payload["token_budget"] = json!(token_budget);
-        }
+        // REMOVED: processing_priority and token_budget fields as they are not accepted by BrightData API
 
         let client = Client::builder()
             .timeout(Duration::from_secs(90))

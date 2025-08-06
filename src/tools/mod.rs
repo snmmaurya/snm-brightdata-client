@@ -1,11 +1,10 @@
-// src/tools/mod.rs
+// src/tools/mod.rs - Cleaned up version
 pub mod stock;
 pub mod crypto;
 pub mod etf;
 pub mod bond;
 pub mod mutual_fund;
 pub mod commodity;
-pub mod market;
 pub mod extract;
 pub mod scrape;
 pub mod search;

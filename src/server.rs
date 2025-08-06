@@ -136,7 +136,6 @@ pub async fn handle_mcp_request(
                         { "name": "get_bond_data", "description": "Get bond market data" },
                         { "name": "get_mutual_fund_data", "description": "Get mutual fund data" },
                         { "name": "get_commodity_data", "description": "Get commodity market data" },
-                        { "name": "get_market_overview", "description": "Get market overview" },
                         { "name": "multi_zone_search", "description": "Search across multiple zones" }
                     ],
                     "session_id": current_session
@@ -178,7 +177,6 @@ pub async fn handle_mcp_request(
                     "get_bond_data" => handle_financial_tool("get_bond_data", &args).await,
                     "get_mutual_fund_data" => handle_financial_tool("get_mutual_fund_data", &args).await,
                     "get_commodity_data" => handle_financial_tool("get_commodity_data", &args).await,
-                    "get_market_overview" => handle_financial_tool("get_market_overview", &args).await,
                     "multi_zone_search" => handle_financial_tool("multi_zone_search", &args).await,
                     _ => Err("Unknown tool".to_string()),
                 };

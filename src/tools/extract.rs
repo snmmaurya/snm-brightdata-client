@@ -1,7 +1,7 @@
 // src/tools/extract.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
-use crate::logger::JSON_LOGGER;
+use crate::extras::logger::JSON_LOGGER;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -73,6 +73,11 @@ impl Tool for Extractor {
         })
     }
 
+    // FIXED: Remove the execute method override to use the default one with metrics logging
+    // async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+    //     self.execute_internal(parameters).await
+    // }
+
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let url = parameters
             .get("url")
@@ -120,15 +125,10 @@ impl Tool for Extractor {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false) {
             
-            let response_type = ResponseStrategy::determine_response_type("", url);
-            if matches!(response_type, ResponseType::Empty) {
-                return Ok(ResponseStrategy::create_response("", url, "extraction", "validation", json!({}), response_type));
-            }
-
-            // Budget check for extraction queries
+            // Budget check for extract queries
             let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
             if remaining_tokens < 150 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
-                return Ok(ResponseStrategy::create_response("", url, "extraction", "budget_limit", json!({}), ResponseType::Skip));
+                return Ok(ResponseStrategy::create_response("", url, "extract", "budget_limit", json!({}), ResponseType::Skip));
             }
         }
 

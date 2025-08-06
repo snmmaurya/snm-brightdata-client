@@ -26,7 +26,7 @@ impl EnhancedLogger {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         
         // Log to existing logger (snm-brightdata-client/src/extras/logger.rs)
-        if let Err(e) = crate::logger::JSON_LOGGER.log_brightdata_request(
+        if let Err(e) = crate::extras::logger::JSON_LOGGER.log_brightdata_request(
             execution_id,
             zone,
             url,

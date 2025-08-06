@@ -294,6 +294,7 @@ impl JsonLogger {
 // Singleton instance for global access
 lazy_static::lazy_static! {
     pub static ref JSON_LOGGER: JsonLogger = JsonLogger::new(
-        std::env::var("LOG_DIRECTORY").ok()
+        std::env::var("BRIGHTDATA_JSON_LOG_PATH").ok()
+            .or_else(|| std::env::var("LOG_DIRECTORY").ok())
     );
 }
