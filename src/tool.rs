@@ -483,9 +483,9 @@ impl ToolResolver {
         match name {
             // Core tools
             "scrape_website" => Some(Box::new(crate::tools::scrape::ScrapeMarkdown)),
-            "search_web" => Some(Box::new(crate::tools::search::SearchEngine)),
+            // "search_web" => Some(Box::new(crate::tools::search::SearchEngine)),
             "extract_data" => Some(Box::new(crate::tools::extract::Extractor)),
-            "take_screenshot" => Some(Box::new(crate::tools::screenshot::ScreenshotTool)),
+            // "take_screenshot" => Some(Box::new(crate::tools::screenshot::ScreenshotTool)),
             
             // Financial tools - using individual modules
             "get_stock_data" => Some(Box::new(crate::tools::stock::StockDataTool)),
@@ -529,31 +529,31 @@ impl ToolResolver {
                     "required": ["url"]
                 }
             }),
-            serde_json::json!({
-                "name": "search_web",
-                "description": "Search the web using various search engines via BrightData",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search query"
-                        },
-                        "engine": {
-                            "type": "string",
-                            "enum": ["google", "bing", "yandex", "duckduckgo"],
-                            "description": "Search engine to use",
-                            "default": "google"
-                        },
-                        "cursor": {
-                            "type": "string",
-                            "description": "Pagination cursor/page number",
-                            "default": "0"
-                        }
-                    },
-                    "required": ["query"]
-                }
-            }),
+            // serde_json::json!({
+            //     "name": "search_web",
+            //     "description": "Search the web using various search engines via BrightData",
+            //     "inputSchema": {
+            //         "type": "object",
+            //         "properties": {
+            //             "query": {
+            //                 "type": "string",
+            //                 "description": "Search query"
+            //             },
+            //             "engine": {
+            //                 "type": "string",
+            //                 "enum": ["google", "bing", "yandex", "duckduckgo"],
+            //                 "description": "Search engine to use",
+            //                 "default": "google"
+            //             },
+            //             "cursor": {
+            //                 "type": "string",
+            //                 "description": "Pagination cursor/page number",
+            //                 "default": "0"
+            //             }
+            //         },
+            //         "required": ["query"]
+            //     }
+            // }),
             serde_json::json!({
                 "name": "extract_data",
                 "description": "Extract structured data from a webpage using AI analysis",
@@ -741,7 +741,7 @@ impl ToolResolver {
     pub fn get_available_tool_names(&self) -> Vec<&'static str> {
         vec![
             "scrape_website",
-            "search_web", 
+            // "search_web", 
             "extract_data",
             // "take_screenshot",
             "get_stock_data",
