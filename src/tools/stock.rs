@@ -1,4 +1,4 @@
-// src/tools/stock.rs - ENHANCED VERSION WITH PROXY FALLBACK SUPPORT
+// src/tools/stock.rs - ENHANCED VERSION WITH DEDUCT_DATA SUPPORT ONLY
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
@@ -117,7 +117,7 @@ impl Tool for StockDataTool {
                 let source_used = result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Unknown");
                 let method_used = result.get("method_used").and_then(|m| m.as_str()).unwrap_or("Unknown");
                 
-                // Create formatted markdown response
+                // Create formatted response based on DEDUCT_DATA setting
                 let formatted_response = self.create_formatted_stock_response(
                     query, market, content, source_used, method_used, 
                     data_type, timeframe, include_ratios, include_volume, &execution_id
@@ -128,9 +128,8 @@ impl Tool for StockDataTool {
                     result
                 );
                 
-                if std::env::var("TRUNCATE_FILTER")
-                    .map(|v| v.to_lowercase() == "true")
-                    .unwrap_or(false) {
+                // Apply filtering only if DEDUCT_DATA=true
+                if self.is_data_reduction_enabled() {
                     Ok(ResponseStrategy::apply_size_limits(tool_result))
                 } else {
                     Ok(tool_result)
@@ -157,7 +156,14 @@ impl Tool for StockDataTool {
 }
 
 impl StockDataTool {
-    /// Create formatted markdown response with filtered financial data  
+    /// ENHANCED: Check if data reduction is enabled via DEDUCT_DATA environment variable only
+    fn is_data_reduction_enabled(&self) -> bool {
+        std::env::var("DEDUCT_DATA")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase() == "true"
+    }
+
+    /// ENHANCED: Create formatted response with DEDUCT_DATA control
     fn create_formatted_stock_response(
         &self,
         query: &str,
@@ -171,108 +177,55 @@ impl StockDataTool {
         include_volume: bool,
         execution_id: &str
     ) -> String {
-        // Extract key financial data using existing filter methods
-        let filtered_data = self.extract_essential_stock_data(content, query);
-        
-        if filtered_data.is_empty() || filtered_data == "No data" {
+        // If DEDUCT_DATA=false, return full content with basic formatting
+        if !self.is_data_reduction_enabled() {
             return format!(
-                "📈 **{}** | Market: {} | Method: {}\n\n❌ **No financial data available**\n\n*Try with exact stock symbol (e.g., TATAMOTORS.NS, AAPL)*",
-                query.to_uppercase(), market.to_uppercase(), method
+                "📈 **{}** | {} Market\n\n## Full Content\n{}\n\n*Source: {} via {} • Type: {} • Period: {}*",
+                query.to_uppercase(), 
+                market.to_uppercase(), 
+                content,
+                source, 
+                method, 
+                data_type, 
+                timeframe
             );
         }
 
-        // Create clean markdown format
-        let mut response = String::new();
-        response.push_str(&format!("📈 **{}** | {} Market\n\n", query.to_uppercase(), market.to_uppercase()));
-        
-        // Add financial metrics in clean format
-        response.push_str("## Key Metrics\n");
-        response.push_str(&self.format_financial_metrics(&filtered_data));
-        response.push_str("\n\n");
-        
-        // Add metadata in compact format
-        response.push_str(&format!(
-            "*Source: {} via {} • Type: {} • Period: {}*",
-            source, method, data_type, timeframe
-        ));
-        
-        response
+        // TODO: Add filtered data extraction logic when DEDUCT_DATA=true
+        // For now, return full content formatted
+        format!(
+            "📈 **{}** | {} Market\n\n## Content (TODO: Add Filtering)\n{}\n\n*Source: {} via {} • Type: {} • Period: {}*",
+            query.to_uppercase(), 
+            market.to_uppercase(), 
+            content,
+            source, 
+            method, 
+            data_type, 
+            timeframe
+        )
     }
     
-    /// Extract essential stock data using existing filter methods
+    /// TODO: Extract essential stock data using existing filter methods
     fn extract_essential_stock_data(&self, content: &str, query: &str) -> String {
-        // Use the existing ResponseFilter methods for consistency
-        if std::env::var("TRUNCATE_FILTER").map(|v| v.to_lowercase() == "true").unwrap_or(false) {
-            // Use existing high-value extraction method
-            let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
-            ResponseFilter::extract_high_value_financial_data(content, recommended_tokens)
-        } else {
-            // For non-filtered mode, extract key lines containing financial data
-            self.extract_financial_lines(content)
-        }
+        // TODO: Add essential stock data extraction logic
+        // For now, return original content
+        content.to_string()
     }
     
-    /// Extract financial lines when filtering is disabled
+    /// TODO: Extract financial lines when filtering is disabled
     fn extract_financial_lines(&self, content: &str) -> String {
-        let lines: Vec<&str> = content
-            .lines()
-            .filter(|line| {
-                let line_lower = line.to_lowercase();
-                line.len() > 10 && line.len() < 200 && (
-                    line_lower.contains("₹") || line_lower.contains("$") || 
-                    line_lower.contains("price") || line_lower.contains("market cap") ||
-                    line_lower.contains("pe ratio") || line_lower.contains("volume") ||
-                    line_lower.contains("dividend") || line_lower.contains("revenue")
-                )
-            })
-            .take(5) // Limit to 5 most relevant lines
-            .collect();
-            
-        if lines.is_empty() {
-            "No data".to_string()
-        } else {
-            lines.join(" | ")
-        }
+        // TODO: Add financial lines extraction logic
+        // For now, return original content
+        content.to_string()
     }
     
-    /// Format financial metrics into clean markdown
+    /// TODO: Format financial metrics into clean markdown
     fn format_financial_metrics(&self, data: &str) -> String {
-        if data == "No data" || data.is_empty() {
-            return "❌ No financial data available".to_string();
-        }
-        
-        // Parse the filtered data and format as bullet points
-        let metrics: Vec<&str> = data.split('|').map(|s| s.trim()).collect();
-        let mut formatted = String::new();
-        
-        for metric in metrics {
-            if metric.is_empty() { continue; }
-            
-            // Format different types of metrics
-            let formatted_metric = if metric.starts_with("₹") {
-                format!("• **Current Price**: {}", metric)
-            } else if metric.starts_with("MC₹") {
-                format!("• **Market Cap**: {}", &metric[2..])
-            } else if metric.starts_with("PE") {
-                format!("• **P/E Ratio**: {}", &metric[2..])
-            } else if metric.starts_with("V") {
-                format!("• **Volume**: {}", &metric[1..])
-            } else if metric.starts_with("DY") {
-                format!("• **Dividend Yield**: {}%", &metric[2..].replace("%", ""))
-            } else {
-                format!("• {}", metric)
-            };
-            
-            formatted.push_str(&formatted_metric);
-            formatted.push('\n');
-        }
-        
-        if formatted.is_empty() {
-            "❌ Unable to parse financial data".to_string()
-        } else {
-            formatted.trim_end().to_string()
-        }
+        // TODO: Add financial metrics formatting logic
+        // For now, return data as-is
+        data.to_string()
     }
+
     async fn fetch_stock_data_with_fallbacks_and_priority(
         &self, 
         query: &str, 
@@ -290,8 +243,7 @@ impl StockDataTool {
         let mut attempts = Vec::new();
 
         for (sequence, (url, source_name)) in urls_to_try.iter().enumerate() {
-            // Always try both methods: Direct API first, then Proxy fallback
-            // let methods_to_try = vec![("direct", "Direct API"), ("proxy", "Proxy Fallback")];
+            // Try proxy method only for now
             let methods_to_try = vec![("proxy", "Proxy Fallback")];
 
             for (method_sequence, (method_type, method_name)) in methods_to_try.iter().enumerate() {
@@ -329,10 +281,10 @@ impl StockDataTool {
                             "method_sequence": method_sequence + 1
                         }));
                         
-                        let should_try_next = if std::env::var("TRUNCATE_FILTER")
-                            .map(|v| v.to_lowercase() == "true")
-                            .unwrap_or(false) {
-                            content.len() < 200 || ResponseStrategy::should_try_next_source(content)
+                        // TODO: Add content quality check when DEDUCT_DATA=true
+                        let should_try_next = if self.is_data_reduction_enabled() {
+                            // TODO: Add quality-based next source logic
+                            false
                         } else {
                             false
                         };
@@ -347,24 +299,10 @@ impl StockDataTool {
                             }
                         }
                         
-                        // SUCCESS - but validate data quality first
-                        if content.len() < 50 && !ResponseFilter::contains_financial_data(content) {
-                            warn!("Low quality data from {} via {}, treating as insufficient", source_name, method_name);
-                            attempts.push(json!({
-                                "source": source_name,
-                                "url": url,
-                                "method": method_name,
-                                "status": "low_quality",
-                                "content_length": content.len(),
-                                "sequence": sequence + 1,
-                                "method_sequence": method_sequence + 1
-                            }));
-                            
-                            if method_sequence == 0 {
-                                continue; // Try proxy for same URL
-                            } else {
-                                break; // Try next URL  
-                            }
+                        // SUCCESS - but validate data quality first only if DEDUCT_DATA=true
+                        if self.is_data_reduction_enabled() {
+                            // TODO: Add data quality validation when DEDUCT_DATA=true
+                            // For now, accept all content
                         }
                         
                         // SUCCESS
@@ -397,9 +335,6 @@ impl StockDataTool {
                         last_error = Some(e);
                         warn!("❌ Failed to fetch from {} via {} (sequence: {}, method: {}): {:?}", 
                               source_name, method_name, sequence + 1, method_sequence + 1, last_error);
-                        
-                        // For direct API failures, continue to proxy method
-                        // For proxy failures, continue to next URL
                     }
                 }
             }
@@ -520,21 +455,11 @@ impl StockDataTool {
                 continue;
             }
 
-            // SUCCESS - Process response
+            // SUCCESS - Process response (apply filtering only if DEDUCT_DATA=true)
             let raw_content = response_text;
-            let filtered_content = if std::env::var("TRUNCATE_FILTER")
-                .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(false) {
-                
-                if ResponseFilter::is_error_page(&raw_content) {
-                    warn!("Direct API: Detected error page from {}", source_name);
-                    format!("ERROR_PAGE_DETECTED: {}", &raw_content[..raw_content.len().min(1000)])
-                } else if ResponseFilter::is_mostly_navigation(&raw_content) {
-                    warn!("Direct API: Navigation-heavy content from {}", source_name);
-                    ResponseFilter::extract_high_value_financial_data(&raw_content, token_budget / 2)
-                } else {
-                    ResponseFilter::extract_high_value_financial_data(&raw_content, token_budget / 2)
-                }
+            let filtered_content = if self.is_data_reduction_enabled() {
+                // TODO: Add content filtering logic when DEDUCT_DATA=true
+                raw_content.clone()
             } else {
                 raw_content.clone()
             };
@@ -591,7 +516,7 @@ impl StockDataTool {
         Err(last_error.unwrap_or_else(|| BrightDataError::ToolError("Direct API: All retry attempts failed".into())))
     }
 
-    // NEW: Proxy-based method
+    // Proxy-based method
     async fn try_fetch_url_via_proxy(
         &self, 
         url: &str, 
@@ -649,7 +574,6 @@ impl StockDataTool {
 
             let response = client
                 .get(url)
-                // .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
                 .header("x-unblock-data-format", "markdown")
                 .send()
                 .await
@@ -681,7 +605,7 @@ impl StockDataTool {
             
             if !(200..300).contains(&status) {
                 println!("-----------------------------------------------------------------");
-                println!("MARKDIWN SUCCESS: {:?}", status.clone());
+                println!("MARKDOWN SUCCESS: {:?}", status.clone());
                 println!("-----------------------------------------------------------------");
                 let error_msg = format!("Proxy: {} returned HTTP {}: {}", source_name, status, 
                                       &response_text[..response_text.len().min(200)]);
@@ -722,21 +646,11 @@ impl StockDataTool {
                 continue;
             }
 
-            // SUCCESS - Process response
+            // SUCCESS - Process response (apply filtering only if DEDUCT_DATA=true)
             let raw_content = response_text;
-            let filtered_content = if std::env::var("TRUNCATE_FILTER")
-                .map(|v| v.to_lowercase() == "true")
-                .unwrap_or(false) {
-                
-                if ResponseFilter::is_error_page(&raw_content) {
-                    warn!("Proxy: Detected error page from {}", source_name);
-                    format!("ERROR_PAGE_DETECTED: {}", &raw_content[..raw_content.len().min(1000)])
-                } else if ResponseFilter::is_mostly_navigation(&raw_content) {
-                    warn!("Proxy: Navigation-heavy content from {}", source_name);
-                    ResponseFilter::extract_high_value_financial_data(&raw_content, token_budget / 2)
-                } else {
-                    ResponseFilter::extract_high_value_financial_data(&raw_content, token_budget / 2)
-                }
+            let filtered_content = if self.is_data_reduction_enabled() {
+                // TODO: Add content filtering logic when DEDUCT_DATA=true
+                raw_content.clone()
             } else {
                 raw_content.clone()
             };
@@ -810,74 +724,37 @@ impl StockDataTool {
         let mut urls = Vec::new();
         let clean_query = query.trim().to_uppercase();
 
-        // Limit sources based on priority to save tokens
-        let max_sources = match priority {
-            crate::filters::strategy::QueryPriority::Critical => 5,
-            crate::filters::strategy::QueryPriority::High => 4,
-            crate::filters::strategy::QueryPriority::Medium => 3,
-            crate::filters::strategy::QueryPriority::Low => 2,
+        // TODO: Add priority-based URL limiting when DEDUCT_DATA=true
+        let max_sources = if self.is_data_reduction_enabled() {
+            // TODO: Add priority-based source limiting logic
+            5
+        } else {
+            5 // No limit when DEDUCT_DATA=false
         };
 
         if self.is_likely_stock_symbol(&clean_query) {
             match market {
                 "indian" => {
-                    match priority {
-                        crate::filters::strategy::QueryPriority::Critical => {
-                            let symbols_to_try = vec![
-                                format!("{}.NS", clean_query),
-                                format!("{}.BO", clean_query),
-                                clean_query.clone(),
-                            ];
-                            
-                            for (i, symbol) in symbols_to_try.iter().enumerate() {
-                                if i >= max_sources { break; }
-                                urls.push((
-                                    format!("https://finance.yahoo.com/quote/{}/", symbol),
-                                    format!("Yahoo Finance ({})", symbol)
-                                ));
-                            }
-                        }
-                        crate::filters::strategy::QueryPriority::High => {
-                            urls.push((
-                                format!("https://finance.yahoo.com/quote/{}.NS/", clean_query),
-                                format!("Yahoo Finance ({}.NS)", clean_query)
-                            ));
-                            if urls.len() < max_sources {
-                                urls.push((
-                                    format!("https://finance.yahoo.com/quote/{}.NS/", urlencoding::encode(query)),
-                                    "MoneyControl".to_string()
-                                ));
-                            }
-                        }
-                        _ => {
-                            urls.push((
-                                format!("https://finance.yahoo.com/quote/{}.NS/", clean_query),
-                                format!("Yahoo Finance ({}.NS)", clean_query)
-                            ));
-                        }
+                    // TODO: Add priority-based URL selection logic
+                    let symbols_to_try = vec![
+                        format!("{}.NS", clean_query),
+                        format!("{}.BO", clean_query),
+                        clean_query.clone(),
+                    ];
+                    
+                    for (i, symbol) in symbols_to_try.iter().enumerate() {
+                        if i >= max_sources { break; }
+                        urls.push((
+                            format!("https://finance.yahoo.com/quote/{}/", symbol),
+                            format!("Yahoo Finance ({})", symbol)
+                        ));
                     }
                 }
                 "us" => {
-                    match priority {
-                        crate::filters::strategy::QueryPriority::Critical => {
-                            urls.push((
-                                format!("https://finance.yahoo.com/quote/{}/", clean_query),
-                                format!("Yahoo Finance ({})", clean_query)
-                            ));
-                            if urls.len() < max_sources {
-                                urls.push((
-                                    format!("https://www.bloomberg.com/quote/{}", clean_query),
-                                    format!("Bloomberg ({})", clean_query)
-                                ));
-                            }
-                        }
-                        _ => {
-                            urls.push((
-                                format!("https://finance.yahoo.com/quote/{}/", clean_query),
-                                format!("Yahoo Finance ({})", clean_query)
-                            ));
-                        }
-                    }
+                    urls.push((
+                        format!("https://finance.yahoo.com/quote/{}/", clean_query),
+                        format!("Yahoo Finance ({})", clean_query)
+                    ));
                 }
                 "global" => {
                     urls.push((
@@ -889,8 +766,8 @@ impl StockDataTool {
             }
         }
 
-        // Add search fallbacks only for higher priority queries
-        if !matches!(priority, crate::filters::strategy::QueryPriority::Low) && urls.len() < max_sources {
+        // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
+        if urls.len() < max_sources {
             urls.push((
                 format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query)),
                 "Yahoo Finance Search".to_string()
