@@ -1,4 +1,4 @@
-// src/tools/stock.rs - ENHANCED VERSION WITH DEDUCT_DATA SUPPORT ONLY
+// src/tools/stock.rs - ENHANCED VERSION WITH DEDUCT_DATA SUPPORT AND METHOD-SEPARATED URLS
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
@@ -11,6 +11,13 @@ use std::env;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use log::{info, warn, error};
+
+// Struct to organize URLs by method
+#[derive(Debug, Clone)]
+pub struct MethodUrls {
+    pub proxy: Vec<(String, String)>,  // (url, description)
+    pub direct: Vec<(String, String)>, // (url, description)
+}
 
 pub struct StockDataTool;
 
@@ -226,6 +233,96 @@ impl StockDataTool {
         data.to_string()
     }
 
+    /// ENHANCED: Build URLs separated by method (proxy vs direct)
+    fn build_prioritized_urls_with_priority(
+        &self, 
+        query: &str, 
+        market: &str, 
+        data_type: &str,
+        priority: crate::filters::strategy::QueryPriority
+    ) -> MethodUrls {
+        let mut proxy_urls = Vec::new();
+        let mut direct_urls = Vec::new();
+        let clean_query = query.trim().to_uppercase();
+
+        // TODO: Add priority-based URL limiting when DEDUCT_DATA=true
+        let max_sources = if self.is_data_reduction_enabled() {
+            // TODO: Add priority-based source limiting logic
+            5
+        } else {
+            5 // No limit when DEDUCT_DATA=false
+        };
+
+        if self.is_likely_stock_symbol(&clean_query) {
+            match market {
+                "indian" => {
+                    // TODO: Add priority-based URL selection logic
+                    let symbols_to_try = vec![
+                        format!("{}.NS", clean_query),
+                        format!("{}.BO", clean_query),
+                        clean_query.clone(),
+                    ];
+                    
+                    for (i, symbol) in symbols_to_try.iter().enumerate() {
+                        if i >= max_sources { break; }
+                        
+                        let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol);
+                        let description = format!("Yahoo Finance ({})", symbol);
+
+                        let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
+                        let proxy_description = format!("Yahoo Finance ({})", symbol);
+                        
+                        // Add to both proxy and direct (same URLs, different methods)
+                        proxy_urls.push((proxy_url, proxy_description));
+                        direct_urls.push((url, description));
+                    }
+                }
+                "us" => {
+                    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}.NS/", clean_query);
+                    let description = format!("Yahoo Finance ({})", clean_query);
+
+                    let proxy_url = format!("https://finance.yahoo.com/quote/{}.NS/", clean_query);
+                    let proxy_description = format!("Yahoo Finance ({})", clean_query);
+                    
+                    proxy_urls.push((proxy_url, proxy_description));
+                    direct_urls.push((url, description));
+                }
+                "global" => {
+                    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}.NS/", clean_query);
+                    let description = format!("Yahoo Finance Global ({})", clean_query);
+
+                    let proxy_url = format!("https://finance.yahoo.com/quote/{}.NS/", clean_query);
+                    let proxy_description = format!("Yahoo Finance Global ({})", clean_query);
+                    
+                    proxy_urls.push((proxy_url, proxy_description));
+                    direct_urls.push((url, description));
+                }
+                _ => {}
+            }
+        }
+
+        // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
+        if proxy_urls.len() < max_sources {
+            let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", urlencoding::encode(query));
+            let description = "Yahoo Finance Search".to_string();
+
+            let proxy_url = format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query));
+            let proxy_description = "Yahoo Finance Search".to_string();
+            
+            proxy_urls.push((proxy_url, proxy_description));
+            direct_urls.push((url, description));
+        }
+
+        info!("🎯 Generated {} proxy URLs and {} direct URLs for query '{}' (priority: {:?})", 
+              proxy_urls.len(), direct_urls.len(), query, priority);
+        
+        MethodUrls {
+            proxy: proxy_urls,
+            direct: direct_urls,
+        }
+    }
+
+    /// ENHANCED: Main fetch function with method-separated URL structure
     async fn fetch_stock_data_with_fallbacks_and_priority(
         &self, 
         query: &str, 
@@ -238,30 +335,35 @@ impl StockDataTool {
         token_budget: usize,
         execution_id: &str
     ) -> Result<Value, BrightDataError> {
-        let urls_to_try = self.build_prioritized_urls_with_priority(query, market, data_type, query_priority);
+        let method_urls = self.build_prioritized_urls_with_priority(query, market, data_type, query_priority);
         let mut last_error = None;
         let mut attempts = Vec::new();
 
-        for (sequence, (url, source_name)) in urls_to_try.iter().enumerate() {
-            // Try proxy method only for now
-            let methods_to_try = vec![("proxy", "Proxy Fallback")];
+        // Define method priority: try direct first, then proxy
+        let methods_to_try = vec![
+            ("direct", "Direct Call", &method_urls.direct),
+            ("proxy", "Proxy Fallback", &method_urls.proxy)
+        ];
 
-            for (method_sequence, (method_type, method_name)) in methods_to_try.iter().enumerate() {
+        for (method_sequence, (method_type, method_name, urls_for_method)) in methods_to_try.iter().enumerate() {
+            info!("🔄 Trying {} method with {} URLs", method_name, urls_for_method.len());
+            
+            for (url_sequence, (url, source_name)) in urls_for_method.iter().enumerate() {
                 let attempt_result = match *method_type {
                     "direct" => {
-                        info!("🌐 Trying Direct BrightData API for {} (sequence: {}, attempt: {})", 
-                              source_name, sequence, method_sequence + 1);
+                        info!("🌐 Trying Direct BrightData API for {} (method: {}, url: {}/{})", 
+                              source_name, method_sequence + 1, url_sequence + 1, urls_for_method.len());
                         self.try_fetch_url_direct_api(
                             url, query, market, source_name, query_priority, token_budget, 
-                            execution_id, sequence as u64, method_sequence as u64
+                            execution_id, url_sequence as u64, method_sequence as u64
                         ).await
                     }
                     "proxy" => {
-                        info!("🔄 Trying Proxy method for {} (sequence: {}, attempt: {})", 
-                              source_name, sequence, method_sequence + 1);
+                        info!("🔄 Trying Proxy method for {} (method: {}, url: {}/{})", 
+                              source_name, method_sequence + 1, url_sequence + 1, urls_for_method.len());
                         self.try_fetch_url_via_proxy(
                             url, query, market, source_name, query_priority, token_budget, 
-                            execution_id, sequence as u64, method_sequence as u64
+                            execution_id, url_sequence as u64, method_sequence as u64
                         ).await
                     }
                     _ => continue,
@@ -277,8 +379,8 @@ impl StockDataTool {
                             "method": method_name,
                             "status": "success",
                             "content_length": content.len(),
-                            "sequence": sequence + 1,
-                            "method_sequence": method_sequence + 1
+                            "method_sequence": method_sequence + 1,
+                            "url_sequence": url_sequence + 1
                         }));
                         
                         // TODO: Add content quality check when DEDUCT_DATA=true
@@ -289,13 +391,13 @@ impl StockDataTool {
                             false
                         };
                         
-                        if should_try_next && (method_sequence == 0 || sequence < urls_to_try.len() - 1) {
-                            if method_sequence == 0 {
-                                warn!("Content insufficient from {} via {}, trying proxy method", source_name, method_name);
-                                continue; // Try proxy method for same URL
+                        if should_try_next && (url_sequence < urls_for_method.len() - 1 || method_sequence < methods_to_try.len() - 1) {
+                            if url_sequence < urls_for_method.len() - 1 {
+                                warn!("Content insufficient from {} via {}, trying next URL in same method", source_name, method_name);
+                                continue; // Try next URL in same method
                             } else {
-                                warn!("Content insufficient from {} via {}, trying next source", source_name, method_name);
-                                break; // Try next URL
+                                warn!("Content insufficient from {} via {}, trying next method", source_name, method_name);
+                                break; // Try next method
                             }
                         }
                         
@@ -313,11 +415,11 @@ impl StockDataTool {
                         result["priority"] = json!(format!("{:?}", query_priority));
                         result["token_budget"] = json!(token_budget);
                         result["attempts"] = json!(attempts);
-                        result["successful_attempt"] = json!(sequence + 1);
-                        result["successful_method"] = json!(method_sequence + 1);
+                        result["successful_method_sequence"] = json!(method_sequence + 1);
+                        result["successful_url_sequence"] = json!(url_sequence + 1);
                         
-                        info!("✅ Successfully fetched stock data from {} via {} (sequence: {}, method: {})", 
-                              source_name, method_name, sequence + 1, method_sequence + 1);
+                        info!("✅ Successfully fetched stock data from {} via {} (method: {}, url: {})", 
+                              source_name, method_name, method_sequence + 1, url_sequence + 1);
                         
                         return Ok(result);
                     }
@@ -328,13 +430,13 @@ impl StockDataTool {
                             "method": method_name,
                             "status": "failed",
                             "error": e.to_string(),
-                            "sequence": sequence + 1,
-                            "method_sequence": method_sequence + 1
+                            "method_sequence": method_sequence + 1,
+                            "url_sequence": url_sequence + 1
                         }));
                         
                         last_error = Some(e);
-                        warn!("❌ Failed to fetch from {} via {} (sequence: {}, method: {}): {:?}", 
-                              source_name, method_name, sequence + 1, method_sequence + 1, last_error);
+                        warn!("❌ Failed to fetch from {} via {} (method: {}, url: {}): {:?}", 
+                              source_name, method_name, method_sequence + 1, url_sequence + 1, last_error);
                     }
                 }
             }
@@ -349,7 +451,7 @@ impl StockDataTool {
             "status": "no_data_found",
             "attempts": attempts,
             "execution_id": execution_id,
-            "total_attempts": urls_to_try.len() * 2, // Direct + Proxy for each URL
+            "total_attempts": method_urls.direct.len() + method_urls.proxy.len(),
             "reason": "all_sources_failed"
         });
         
@@ -712,70 +814,6 @@ impl StockDataTool {
         }
 
         Err(last_error.unwrap_or_else(|| BrightDataError::ToolError("Proxy: All retry attempts failed".into())))
-    }
-
-    fn build_prioritized_urls_with_priority(
-        &self, 
-        query: &str, 
-        market: &str, 
-        data_type: &str,
-        priority: crate::filters::strategy::QueryPriority
-    ) -> Vec<(String, String)> {
-        let mut urls = Vec::new();
-        let clean_query = query.trim().to_uppercase();
-
-        // TODO: Add priority-based URL limiting when DEDUCT_DATA=true
-        let max_sources = if self.is_data_reduction_enabled() {
-            // TODO: Add priority-based source limiting logic
-            5
-        } else {
-            5 // No limit when DEDUCT_DATA=false
-        };
-
-        if self.is_likely_stock_symbol(&clean_query) {
-            match market {
-                "indian" => {
-                    // TODO: Add priority-based URL selection logic
-                    let symbols_to_try = vec![
-                        format!("{}.NS", clean_query),
-                        format!("{}.BO", clean_query),
-                        clean_query.clone(),
-                    ];
-                    
-                    for (i, symbol) in symbols_to_try.iter().enumerate() {
-                        if i >= max_sources { break; }
-                        urls.push((
-                            format!("https://finance.yahoo.com/quote/{}/", symbol),
-                            format!("Yahoo Finance ({})", symbol)
-                        ));
-                    }
-                }
-                "us" => {
-                    urls.push((
-                        format!("https://finance.yahoo.com/quote/{}/", clean_query),
-                        format!("Yahoo Finance ({})", clean_query)
-                    ));
-                }
-                "global" => {
-                    urls.push((
-                        format!("https://finance.yahoo.com/quote/{}/", clean_query),
-                        format!("Yahoo Finance Global ({})", clean_query)
-                    ));
-                }
-                _ => {}
-            }
-        }
-
-        // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
-        if urls.len() < max_sources {
-            urls.push((
-                format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query)),
-                "Yahoo Finance Search".to_string()
-            ));
-        }
-
-        info!("🎯 Generated {} URLs for query '{}' (priority: {:?})", urls.len(), query, priority);
-        urls
     }
 
     fn is_likely_stock_symbol(&self, query: &str) -> bool {
