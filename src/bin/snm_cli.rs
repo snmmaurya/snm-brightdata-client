@@ -1,5 +1,5 @@
 // src/bin/snm_cli.rs - Cleaned up version
-use snm_brightdata_client::tools::{scrape::ScrapeMarkdown, search::SearchEngine, extract::Extractor, screenshot::ScreenshotTool};
+use snm_brightdata_client::tools::{search::SearchEngine, extract::Extractor, screenshot::ScreenshotTool};
 use snm_brightdata_client::tool::{Tool, ToolResult};
 use snm_brightdata_client::error::BrightDataError;
 use clap::{Parser, Subcommand};
@@ -16,12 +16,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scrape a website and extract content
-    Scrape { 
-        url: String,
-        #[arg(short, long, default_value = "markdown")]
-        format: String,
-    },
     /// Search the web using various engines
     Search { 
         query: String,
@@ -54,12 +48,6 @@ async fn main() {
 
     let cli = Cli::parse();
     match cli.command {
-        Commands::Scrape { url, format } => {
-            let result = ScrapeMarkdown
-                .execute(json!({"url": url, "format": format}))
-                .await;
-            handle_result(result);
-        },
         Commands::Search { query, engine } => {
             let result = SearchEngine
                 .execute(json!({"query": query, "engine": engine}))

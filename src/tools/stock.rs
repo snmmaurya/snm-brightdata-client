@@ -77,11 +77,33 @@ impl Tool for StockDataTool {
     }
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
-        let query = parameters
+        let mut query = parameters
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'query' parameter".into()))?;
-        
+
+        // Check if it's a URL before splitting
+        let is_url = query.starts_with("http://") || query.starts_with("https://") || query.contains("://");
+
+        query = if !is_url {
+            query.split('.').next().unwrap_or(query)
+        } else {
+            query
+        };
+
+        // Normalize known aliases
+        let normalized = query.to_lowercase();
+        query = match normalized.as_str() {
+            "zomato" => "ETERNAL",
+            "hdfc" => "HDFCBANK",
+            "infy" => "INFOSYS",
+            "icici" => "ICICIBANK",
+            "suven" => "COHANCE",
+            _ => query,
+        };
+
+
+
         let market = parameters
             .get("market")
             .and_then(|v| v.as_str())
@@ -266,7 +288,7 @@ impl StockDataTool {
                     for (i, symbol) in symbols_to_try.iter().enumerate() {
                         if i >= max_sources { break; }
                         
-                        let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", symbol);
+                        let url = format!("https://finance.yahoo.com/quote/{}", symbol);
                         let description = format!("Yahoo Finance ({})", symbol);
 
                         let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
@@ -278,7 +300,7 @@ impl StockDataTool {
                     }
                 }
                 "us" => {
-                    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}.NS/", clean_query);
+                    let url = format!("https://finance.yahoo.com/quote/{}.NS/", clean_query);
                     let description = format!("Yahoo Finance ({})", clean_query);
 
                     let proxy_url = format!("https://finance.yahoo.com/quote/{}.NS/", clean_query);
@@ -288,7 +310,7 @@ impl StockDataTool {
                     direct_urls.push((url, description));
                 }
                 "global" => {
-                    let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}.NS/", clean_query);
+                    let url = format!("https://finance.yahoo.com/quote/{}.NS/", clean_query);
                     let description = format!("Yahoo Finance Global ({})", clean_query);
 
                     let proxy_url = format!("https://finance.yahoo.com/quote/{}.NS/", clean_query);
@@ -303,7 +325,7 @@ impl StockDataTool {
 
         // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
         if proxy_urls.len() < max_sources {
-            let url = format!("https://query1.finance.yahoo.com/v8/finance/chart/{}", urlencoding::encode(query));
+            let url = format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query));
             let description = "Yahoo Finance Search".to_string();
 
             let proxy_url = format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query));
@@ -341,7 +363,7 @@ impl StockDataTool {
 
         // Define method priority: try direct first, then proxy
         let methods_to_try = vec![
-            ("direct", "Direct Call", &method_urls.direct),
+            // ("direct", "Direct Call", &method_urls.direct),
             ("proxy", "Proxy Fallback", &method_urls.proxy)
         ];
 
@@ -499,7 +521,7 @@ impl StockDataTool {
                 "url": url,
                 "zone": zone,
                 "format": "raw",
-                "data_format": "markdown"
+                // "data_format": "markdown"
             });
 
             if retry_attempt == 0 {

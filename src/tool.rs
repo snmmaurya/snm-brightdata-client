@@ -482,7 +482,6 @@ impl ToolResolver {
     pub fn resolve(&self, name: &str) -> Option<Box<dyn Tool + Send + Sync>> {
         match name {
             // Core tools
-            "scrape_website" => Some(Box::new(crate::tools::scrape::ScrapeMarkdown)),
             // "search_web" => Some(Box::new(crate::tools::search::SearchEngine)),
             "extract_data" => Some(Box::new(crate::tools::extract::Extractor)),
             // "take_screenshot" => Some(Box::new(crate::tools::screenshot::ScreenshotTool)),
@@ -509,26 +508,6 @@ impl ToolResolver {
     pub fn list_tools(&self) -> Vec<Value> {
         vec![
             // Core tools
-            serde_json::json!({
-                "name": "scrape_website",
-                "description": "Scrape a webpage and return markdown content using BrightData Web Unlocker",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to scrape"
-                        },
-                        "format": {
-                            "type": "string",
-                            "enum": ["markdown", "raw"],
-                            "description": "Output format",
-                            "default": "markdown"
-                        }
-                    },
-                    "required": ["url"]
-                }
-            }),
             // serde_json::json!({
             //     "name": "search_web",
             //     "description": "Search the web using various search engines via BrightData",
@@ -740,7 +719,6 @@ impl ToolResolver {
     // Helper method to get all available tool names
     pub fn get_available_tool_names(&self) -> Vec<&'static str> {
         vec![
-            "scrape_website",
             // "search_web", 
             "extract_data",
             // "take_screenshot",
