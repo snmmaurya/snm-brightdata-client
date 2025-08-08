@@ -11,6 +11,7 @@ use std::env;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use log::{info, warn, error};
+use crate::symbols::stock_symbol::match_symbol_from_query;
 
 // Struct to organize URLs by method
 #[derive(Debug, Clone)]
@@ -77,31 +78,27 @@ impl Tool for StockDataTool {
     }
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
-        let mut query = parameters
+        let raw_query = parameters
             .get("query")
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'query' parameter".into()))?;
 
-        // Check if it's a URL before splitting
-        let is_url = query.starts_with("http://") || query.starts_with("https://") || query.contains("://");
+        // Step 1: Resolve known symbols (or fallback)
+        let matched_symbol = match_symbol_from_query(raw_query);
 
-        query = if !is_url {
-            query.split('.').next().unwrap_or(query)
-        } else {
-            query
-        };
+        // Step 2: Strip trailing .com / .xyz etc.
+        let trimmed = matched_symbol.split('.').next().unwrap_or(&matched_symbol);
 
-        // Normalize known aliases
-        let normalized = query.to_lowercase();
-        query = match normalized.as_str() {
+        // Step 3: Normalize known aliases
+        let normalized = trimmed.to_lowercase();
+        let query = match normalized.as_str() {
             "zomato" => "ETERNAL",
             "hdfc" => "HDFCBANK",
             "infy" => "INFOSYS",
             "icici" => "ICICIBANK",
             "suven" => "COHANCE",
-            _ => query,
+            _ => trimmed,
         };
-
 
 
         let market = parameters

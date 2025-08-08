@@ -10,6 +10,7 @@ pub mod server;
 pub mod extras;
 pub mod filters;
 pub mod metrics;
+pub mod symbols;
 
 // Core re-exports
 pub use client::BrightDataClient;
