@@ -9,20 +9,18 @@ fn known_name_to_symbol_map() -> HashMap<&'static str, &'static str> {
         ("tata motors", "TATAMOTORS"),
         ("reliance", "RELIANCE"),
         ("infosys", "INFY"),
+        ("infy", "INFY"),
         ("hdfc bank", "HDFCBANK"),
         ("icici bank", "ICICIBANK"),
         ("sbi", "SBIN"),
         ("hcl", "HCLTECH"),
         ("maruti", "MARUTI"),
         ("l&t", "LT"),
-        ("zomato", "ZOMATO"),
         ("paytm", "PAYTM"),
-        ("flipkart", "WMT"), // Walmart owns Flipkart
         ("nykaa", "NYKAA"),
-        ("ola", "OLACABS"), // not public yet
+        ("ola", "OLAELEC"),
         ("mahindra", "M&M"),
         ("zomato", "ETERNAL"),
-        ("infy", "INFOSYS"),
         ("suven", "COHANCE")
     ])
 }

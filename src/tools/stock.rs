@@ -87,19 +87,7 @@ impl Tool for StockDataTool {
         let matched_symbol = match_symbol_from_query(raw_query);
 
         // Step 2: Strip trailing .com / .xyz etc.
-        let trimmed = matched_symbol.split('.').next().unwrap_or(&matched_symbol);
-
-        // Step 3: Normalize known aliases
-        let normalized = trimmed.to_lowercase();
-        let query = match normalized.as_str() {
-            "zomato" => "ETERNAL",
-            "hdfc" => "HDFCBANK",
-            "infy" => "INFOSYS",
-            "icici" => "ICICIBANK",
-            "suven" => "COHANCE",
-            _ => trimmed,
-        };
-
+        let query = matched_symbol.split('.').next().unwrap_or(&matched_symbol);
 
         let market = parameters
             .get("market")
