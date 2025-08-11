@@ -484,6 +484,7 @@ impl ToolResolver {
             // Core tools
             // "search_web" => Some(Box::new(crate::tools::search::SearchEngine)),
             "extract_data" => Some(Box::new(crate::tools::extract::Extractor)),
+            "scrape_website" => Some(Box::new(crate::tools::scrape::Scraper)),
             // "take_screenshot" => Some(Box::new(crate::tools::screenshot::ScreenshotTool)),
             
             // Financial tools - using individual modules
@@ -533,6 +534,25 @@ impl ToolResolver {
             //         "required": ["query"]
             //     }
             // }),
+            serde_json::json!({
+                "name": "scrape_website",
+                "description": "Scrap structured data from a webpage using AI analysis",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to Scrap data from"
+                        },
+                        "schema": {
+                            "type": "object",
+                            "description": "Optional schema to guide extraction",
+                            "additionalProperties": true
+                        }
+                    },
+                    "required": ["url"]
+                }
+            }),
             serde_json::json!({
                 "name": "extract_data",
                 "description": "Extract structured data from a webpage using AI analysis",
@@ -721,6 +741,7 @@ impl ToolResolver {
         vec![
             // "search_web", 
             "extract_data",
+            "scrape_website",
             // "take_screenshot",
             "get_stock_data",
             "get_crypto_data",

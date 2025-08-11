@@ -6,6 +6,7 @@ pub mod bond;
 pub mod mutual_fund;
 pub mod commodity;
 pub mod extract;
+pub mod scrape;
 pub mod search;
 pub mod screenshot;
 pub mod multi_zone_search;

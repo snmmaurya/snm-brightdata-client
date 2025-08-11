@@ -1,4 +1,4 @@
-// src/tools/extract.rs
+// src/tools/scrape.rs
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::extras::logger::JSON_LOGGER;
@@ -11,16 +11,16 @@ use std::time::Duration;
 use std::collections::HashMap;
 use log::info;
 
-pub struct Extractor;
+pub struct Scraper;
 
 #[async_trait]
-impl Tool for Extractor {
+impl Tool for Scraper {
     fn name(&self) -> &str {
-        "extract_data"
+        "scrape_website"
     }
 
     fn description(&self) -> &str {
-        "Extract structured data from a webpage using BrightData with WEB_UNLOCKER_ZONE"
+        "Scrape a webpage using BrightData - supports API, Web Unlocker, and Residential Proxy"
     }
 
     fn input_schema(&self) -> Value {
@@ -29,29 +29,55 @@ impl Tool for Extractor {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to extract data from"
+                    "description": "The URL to scrape"
                 },
-                "data_type": {
+                "method": {
                     "type": "string",
-                    "enum": ["auto", "financial", "ecommerce", "social", "news", "general"],
-                    "default": "auto",
-                    "description": "Type of data to extract for optimized processing"
+                    "enum": ["api", "web_unlocker_proxy", "residential_proxy", "auto"],
+                    "description": "Method: 'api' for REST API, 'web_unlocker_proxy' for Web Unlocker proxy, 'residential_proxy' for standard proxy, 'auto' to detect best available",
+                    "default": "auto"
                 },
-                "extraction_format": {
+                "format": {
                     "type": "string",
-                    "enum": ["markdown", "json", "structured", "raw"],
-                    "default": "structured",
-                    "description": "Format for extracted data"
+                    "enum": ["raw", "markdown", "screenshot"],
+                    "description": "Output format - raw (HTML), markdown, or screenshot (Web Unlocker only)",
+                    "default": "markdown"
                 },
-                "clean_content": {
+                "country": {
+                    "type": "string",
+                    "description": "Country code for geo-targeting (e.g., 'us', 'in', 'uk')",
+                    "default": ""
+                },
+                "city": {
+                    "type": "string",
+                    "description": "City for geo-targeting (Web Unlocker only)",
+                    "default": ""
+                },
+                "zipcode": {
+                    "type": "string",
+                    "description": "Zipcode for precise geo-targeting (Web Unlocker only)",
+                    "default": ""
+                },
+                "mobile": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "Remove navigation, ads, and boilerplate content"
+                    "description": "Use mobile user agent",
+                    "default": false
                 },
-                "schema": {
+                "wait_for": {
+                    "type": "string",
+                    "description": "CSS selector or text to wait for (Web Unlocker only)",
+                    "default": ""
+                },
+                "custom_headers": {
                     "type": "object",
-                    "description": "Optional schema to guide extraction",
-                    "additionalProperties": true
+                    "description": "Custom headers to send",
+                    "additionalProperties": true,
+                    "default": {}
+                },
+                "disable_captcha_solving": {
+                    "type": "boolean",
+                    "description": "Disable automatic CAPTCHA solving (Web Unlocker only)",
+                    "default": false
                 }
             },
             "required": ["url"]
@@ -83,12 +109,12 @@ impl Tool for Extractor {
 
         let execution_id = self.generate_execution_id();
         
-        match self.extract_with_brightdata(url, data_type, extraction_format, clean_content, schema, &execution_id).await {
+        match self.scrape_with_brightdata(url, data_type, extraction_format, clean_content, schema, &execution_id).await {
             Ok(result) => {
                 let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 
                 // Create formatted response based on DEDUCT_DATA setting
-                let formatted_response = self.create_formatted_extract_response(
+                let formatted_response = self.create_formatted_scrape_response(
                     url, data_type, extraction_format, content, &execution_id
                 );
                 
@@ -123,7 +149,7 @@ impl Tool for Extractor {
     }
 }
 
-impl Extractor {
+impl Scraper {
     /// Check if data reduction is enabled via DEDUCT_DATA environment variable only
     fn is_data_reduction_enabled(&self) -> bool {
         std::env::var("DEDUCT_DATA")
@@ -132,7 +158,7 @@ impl Extractor {
     }
 
     /// Create formatted response with DEDUCT_DATA control
-    fn create_formatted_extract_response(
+    fn create_formatted_scrape_response(
         &self,
         url: &str,
         data_type: &str,
@@ -165,11 +191,11 @@ impl Extractor {
     }
 
     fn generate_execution_id(&self) -> String {
-        format!("extract_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"))
+        format!("scrape_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"))
     }
 
     /// Extract data with BrightData using only WEB_UNLOCKER_ZONE
-    async fn extract_with_brightdata(
+    async fn scrape_with_brightdata(
         &self,
         url: &str,
         data_type: &str,
