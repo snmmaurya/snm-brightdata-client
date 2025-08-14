@@ -548,9 +548,13 @@ impl ToolResolver {
                             "type": "object",
                             "description": "Optional schema to guide extraction",
                             "additionalProperties": true
+                        },
+                        "user_id": {
+                            "type": "string", 
+                            "description": "Session ID for caching and conversation context tracking"
                         }
                     },
-                    "required": ["url"]
+                    "required": ["url", "user_id"]
                 }
             }),
             serde_json::json!({
@@ -567,9 +571,13 @@ impl ToolResolver {
                             "type": "object",
                             "description": "Optional schema to guide extraction",
                             "additionalProperties": true
+                        },
+                        "user_id": {
+                            "type": "string", 
+                            "description": "Session ID for caching and conversation context tracking"
                         }
                     },
-                    "required": ["url"]
+                    "required": ["url", "user_id"]
                 }
             }),
             // serde_json::json!({
@@ -609,22 +617,26 @@ impl ToolResolver {
             // Financial tools
             serde_json::json!({
                 "name": "get_stock_data",
-                "description": "Get comprehensive stock data including prices, performance, market cap, volumes. Use for individual stocks, stock comparisons, or stock market overviews",
+                "description": "Get comprehensive stock data including prices, performance, market cap, volumes for specific stock symbols",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": {
+                        "symbol": {
                             "type": "string", 
-                            "description": "Stock symbol (e.g. ASHOKLEY, TCS, AAPL), company name, comparison query (AAPL vs MSFT), or market overview request (today's stock performance, Nifty 50 performance)" 
+                            "description": "Stock symbol or ticker (e.g. ASHOKLEY, TCS, RELIANCE for Indian stocks; AAPL, MSFT, GOOGL for US stocks). Use exact trading symbols only."
                         },
                         "market": { 
                             "type": "string", 
                             "enum": ["indian", "us", "global"], 
                             "default": "indian",
                             "description": "Market region - indian for NSE/BSE stocks, us for NASDAQ/NYSE, global for international"
+                        },
+                        "user_id": {
+                            "type": "string", 
+                            "description": "Session ID for caching and conversation context tracking"
                         }
                     },
-                    "required": ["query"]
+                    "required": ["symbol", "user_id"]
                 }
             }),
             serde_json::json!({

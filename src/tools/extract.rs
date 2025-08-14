@@ -29,32 +29,14 @@ impl Tool for Extractor {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to extract data from"
+                    "description": "The URL to scrape"
                 },
-                "data_type": {
+                "session_id": {
                     "type": "string",
-                    "enum": ["auto", "financial", "ecommerce", "social", "news", "general"],
-                    "default": "auto",
-                    "description": "Type of data to extract for optimized processing"
-                },
-                "extraction_format": {
-                    "type": "string",
-                    "enum": ["markdown", "json", "structured", "raw"],
-                    "default": "structured",
-                    "description": "Format for extracted data"
-                },
-                "clean_content": {
-                    "type": "boolean",
-                    "default": true,
-                    "description": "Remove navigation, ads, and boilerplate content"
-                },
-                "schema": {
-                    "type": "object",
-                    "description": "Optional schema to guide extraction",
-                    "additionalProperties": true
+                    "description": "Session ID for caching and conversation context tracking"
                 }
             },
-            "required": ["url"]
+            "required": ["url", "session_id"]
         })
     }
 

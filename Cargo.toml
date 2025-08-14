@@ -1,6 +1,6 @@
 [package]
 name = "snm-brightdata-client"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = "Bright Data Wrapper Client Highly compacted Data implemented in Rust with Actix Web"
 authors = ["Inx Maurya <you@example.com>"]
@@ -39,6 +39,7 @@ bytes = "1.0"
 regex = "1.0"
 lazy_static = "1.4"  # Add this line
 once_cell = "1.21.3"
+redis = { version = "0.32.0", features = ["tokio-native-tls-comp"] }
 
 [lib]
 name = "snm_brightdata_client"

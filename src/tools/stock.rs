@@ -1,9 +1,10 @@
-// src/tools/stock.rs - ENHANCED VERSION WITH DEDUCT_DATA SUPPORT AND METHOD-SEPARATED URLS
+// src/tools/stock.rs - ENHANCED VERSION WITH REDIS CACHE AND DEDUCT_DATA SUPPORT
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use crate::extras::logger::JSON_LOGGER;
 use crate::metrics::brightdata_logger::BRIGHTDATA_METRICS;
+use crate::services::cache::stock_cache::get_stock_cache;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -40,6 +41,10 @@ impl Tool for StockDataTool {
                     "type": "string",
                     "description": "Stock symbol (e.g. TATAMOTORS, TCS, AAPL), company name, comparison query, or market overview request"
                 },
+                "symbol": {
+                    "type": "string",
+                    "description": "Stock symbol (e.g. TATAMOTORS, TCS, AAPL), company name, comparison query, or market overview request"
+                },
                 "market": {
                     "type": "string",
                     "enum": ["indian", "us", "global"],
@@ -67,7 +72,11 @@ impl Tool for StockDataTool {
                     "type": "boolean",
                     "default": true,
                     "description": "Include trading volume and liquidity data"
-                }
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Session identifier for caching (optional, will use default if not provided)"
+                },
             },
             "required": ["query"]
         })
@@ -79,9 +88,14 @@ impl Tool for StockDataTool {
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
         let raw_query = parameters
-            .get("query")
+            .get("symbol")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BrightDataError::ToolError("Missing 'query' parameter".into()))?;
+            .ok_or_else(|| BrightDataError::ToolError("Missing 'symbol' parameter".into()))?;
+
+        let session_id = parameters
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BrightDataError::ToolError("Missing 'user_id' parameter".into()))?;
 
         // Step 1: Resolve known symbols (or fallback)
         let matched_symbol = match_symbol_from_query(raw_query);
@@ -119,14 +133,55 @@ impl Tool for StockDataTool {
 
         let execution_id = format!("stock_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
         
-        info!("📈 Stock query: '{}' (market: {}, priority: {:?}, tokens: {})", 
-              query, market, query_priority, recommended_tokens);
+        info!("📈 Stock query: '{}' (market: {}, priority: {:?}, tokens: {}, session: {})", 
+              query, market, query_priority, recommended_tokens, session_id);
         
+        // 🎯 CACHE CHECK - Check Redis cache first
+        match self.check_cache_first(query, session_id).await {
+            Ok(Some(cached_result)) => {
+                info!("🚀 Cache HIT: Returning cached data for {} in session {}", query, session_id);
+                
+                // Create tool result from cached data
+                let content = cached_result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let source_used = cached_result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Cache");
+                let method_used = "Redis Cache";
+                
+                let formatted_response = self.create_formatted_stock_response(
+                    query, market, content, source_used, method_used, 
+                    data_type, timeframe, include_ratios, include_volume, &execution_id
+                );
+                
+                let tool_result = ToolResult::success_with_raw(
+                    vec![McpContent::text(formatted_response)], 
+                    cached_result
+                );
+                
+                // Apply filtering only if DEDUCT_DATA=true
+                if self.is_data_reduction_enabled() {
+                    return Ok(ResponseStrategy::apply_size_limits(tool_result));
+                } else {
+                    return Ok(tool_result);
+                }
+            }
+            Ok(None) => {
+                info!("💾 Cache MISS: Fetching fresh data for {} in session {}", query, session_id);
+            }
+            Err(e) => {
+                warn!("🚨 Cache error (continuing with fresh fetch): {}", e);
+            }
+        }
+
+        // 🌐 FRESH FETCH - Cache miss, fetch from sources
         match self.fetch_stock_data_with_fallbacks_and_priority(
             query, market, data_type, timeframe, include_ratios, include_volume,
             query_priority, recommended_tokens, &execution_id
         ).await {
             Ok(result) => {
+                // 🗄️ CACHE STORE - Store successful result in cache
+                if let Err(e) = self.store_in_cache(query, session_id, &result).await {
+                    warn!("Failed to store result in cache: {}", e);
+                }
+                
                 let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 let source_used = result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Unknown");
                 let method_used = result.get("method_used").and_then(|m| m.as_str()).unwrap_or("Unknown");
@@ -157,7 +212,8 @@ impl Tool for StockDataTool {
                     "market": market,
                     "status": "no_data",
                     "reason": "brightdata_error",
-                    "execution_id": execution_id
+                    "execution_id": execution_id,
+                    "session_id": session_id
                 });
                 
                 Ok(ToolResult::success_with_raw(
@@ -240,6 +296,78 @@ impl StockDataTool {
         data.to_string()
     }
 
+    // 🎯 ADDED: Check Redis cache first
+    async fn check_cache_first(
+        &self,
+        query: &str,
+        session_id: &str,
+    ) -> Result<Option<Value>, BrightDataError> {
+        let cache_service = get_stock_cache().await?;
+        cache_service.get_cached_stock_data(session_id, query).await
+    }
+
+    // 🗄️ ADDED: Store successful result in Redis cache
+    async fn store_in_cache(
+        &self,
+        query: &str,
+        session_id: &str,
+        data: &Value,
+    ) -> Result<(), BrightDataError> {
+        let cache_service = get_stock_cache().await?;
+        cache_service.cache_stock_data(session_id, query, data.clone()).await
+    }
+
+    // 🔍 ADDED: Get all cached symbols for session (useful for comparisons)
+    pub async fn get_session_cached_symbols(&self, session_id: &str) -> Result<Vec<String>, BrightDataError> {
+        let cache_service = get_stock_cache().await?;
+        cache_service.get_session_stock_symbols(session_id).await
+    }
+
+    // 🗑️ ADDED: Clear cache for specific symbol
+    pub async fn clear_symbol_cache(
+        &self,
+        symbol: &str,
+        session_id: &str,
+    ) -> Result<(), BrightDataError> {
+        let cache_service = get_stock_cache().await?;
+        cache_service.clear_stock_symbol_cache(session_id, symbol).await
+    }
+
+    // 🗑️ ADDED: Clear entire session cache
+    pub async fn clear_session_cache(&self, session_id: &str) -> Result<u32, BrightDataError> {
+        let cache_service = get_stock_cache().await?;
+        cache_service.clear_session_stock_cache(session_id).await
+    }
+
+    // 📊 ADDED: Get cache statistics
+    pub async fn get_cache_stats(&self) -> Result<Value, BrightDataError> {
+        let cache_service = get_stock_cache().await?;
+        cache_service.get_stock_cache_stats().await
+    }
+
+    // 🏥 ADDED: Enhanced connectivity test including cache
+    pub async fn test_connectivity_with_cache(&self) -> Result<String, BrightDataError> {
+        let mut results = Vec::new();
+        
+        // Test cache connectivity
+        info!("🧪 Testing Redis Cache...");
+        match get_stock_cache().await {
+            Ok(cache_service) => {
+                match cache_service.health_check().await {
+                    Ok(_) => results.push("✅ Redis Cache: SUCCESS".to_string()),
+                    Err(e) => results.push(format!("❌ Redis Cache: FAILED - {}", e)),
+                }
+            }
+            Err(e) => results.push(format!("❌ Redis Cache: FAILED - {}", e)),
+        }
+        
+        // Test existing connectivity
+        let api_test = self.test_connectivity().await?;
+        results.push(api_test);
+        
+        Ok(format!("🔍 Enhanced Connectivity Test Results:\n{}", results.join("\n")))
+    }
+
     /// ENHANCED: Build URLs separated by method (proxy vs direct)
     fn build_prioritized_urls_with_priority(
         &self, 
@@ -252,13 +380,8 @@ impl StockDataTool {
         let mut direct_urls = Vec::new();
         let clean_query = query.trim().to_uppercase();
 
-        // TODO: Add priority-based URL limiting when DEDUCT_DATA=true
-        let max_sources = if self.is_data_reduction_enabled() {
-            // TODO: Add priority-based source limiting logic
-            5
-        } else {
-            5 // No limit when DEDUCT_DATA=false
-        };
+        // Add priority-based URL limiting
+        let max_sources = 3;
 
         if self.is_likely_stock_symbol(&clean_query) {
             match market {

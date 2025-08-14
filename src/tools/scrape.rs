@@ -31,56 +31,12 @@ impl Tool for Scraper {
                     "type": "string",
                     "description": "The URL to scrape"
                 },
-                "method": {
+                "session_id": {
                     "type": "string",
-                    "enum": ["api", "web_unlocker_proxy", "residential_proxy", "auto"],
-                    "description": "Method: 'api' for REST API, 'web_unlocker_proxy' for Web Unlocker proxy, 'residential_proxy' for standard proxy, 'auto' to detect best available",
-                    "default": "auto"
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["raw", "markdown", "screenshot"],
-                    "description": "Output format - raw (HTML), markdown, or screenshot (Web Unlocker only)",
-                    "default": "markdown"
-                },
-                "country": {
-                    "type": "string",
-                    "description": "Country code for geo-targeting (e.g., 'us', 'in', 'uk')",
-                    "default": ""
-                },
-                "city": {
-                    "type": "string",
-                    "description": "City for geo-targeting (Web Unlocker only)",
-                    "default": ""
-                },
-                "zipcode": {
-                    "type": "string",
-                    "description": "Zipcode for precise geo-targeting (Web Unlocker only)",
-                    "default": ""
-                },
-                "mobile": {
-                    "type": "boolean",
-                    "description": "Use mobile user agent",
-                    "default": false
-                },
-                "wait_for": {
-                    "type": "string",
-                    "description": "CSS selector or text to wait for (Web Unlocker only)",
-                    "default": ""
-                },
-                "custom_headers": {
-                    "type": "object",
-                    "description": "Custom headers to send",
-                    "additionalProperties": true,
-                    "default": {}
-                },
-                "disable_captcha_solving": {
-                    "type": "boolean",
-                    "description": "Disable automatic CAPTCHA solving (Web Unlocker only)",
-                    "default": false
+                    "description": "Session ID for caching and conversation context tracking"
                 }
             },
-            "required": ["url"]
+            "required": ["url", "session_id"]
         })
     }
 
