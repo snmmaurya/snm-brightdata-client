@@ -135,7 +135,7 @@ impl StockCache {
             .map_err(|e| BrightDataError::ToolError(format!("Redis connection failed: {}", e)))?;
         
         // Set with TTL
-        conn.set_ex(&key, &json_string, self.ttl as u64).await
+        conn.set_ex::<_, _, ()>(&key, &json_string, self.ttl as u64).await
             .map_err(|e| BrightDataError::ToolError(format!("Stock cache set failed: {}", e)))?;
         
         info!("💾 Cached stock data for {} in session {} (TTL: {}s)", symbol, session_id, self.ttl);

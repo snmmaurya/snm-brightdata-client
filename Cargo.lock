@@ -2211,6 +2211,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+ "url",
  "urlencoding",
  "uuid",
 ]

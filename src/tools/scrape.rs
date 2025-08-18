@@ -1,15 +1,16 @@
-// src/tools/scrape.rs
+// src/tools/scrape.rs - ENHANCED VERSION WITH REDIS CACHE SUPPORT
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::extras::logger::JSON_LOGGER;
 use crate::filters::{ResponseFilter, ResponseStrategy};
+use crate::services::cache::scrape_cache::get_scrape_cache;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::env;
 use std::time::Duration;
 use std::collections::HashMap;
-use log::info;
+use log::{info, warn, error};
 
 pub struct Scraper;
 
@@ -20,7 +21,7 @@ impl Tool for Scraper {
     }
 
     fn description(&self) -> &str {
-        "Scrape a webpage using BrightData - supports API, Web Unlocker, and Residential Proxy"
+        "Scrape a webpage using BrightData with intelligent caching and priority-based processing. Supports Web Unlocker with Redis cache for improved performance."
     }
 
     fn input_schema(&self) -> Value {
@@ -34,10 +35,40 @@ impl Tool for Scraper {
                 "session_id": {
                     "type": "string",
                     "description": "Session ID for caching and conversation context tracking"
+                },
+                "data_type": {
+                    "type": "string",
+                    "enum": ["auto", "article", "product", "news", "contact", "general"],
+                    "default": "auto",
+                    "description": "Type of content to focus on during extraction"
+                },
+                "extraction_format": {
+                    "type": "string",
+                    "enum": ["structured", "markdown", "text", "json"],
+                    "default": "structured",
+                    "description": "Format for extracted content"
+                },
+                "clean_content": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Remove noise and focus on main content"
+                },
+                "schema": {
+                    "type": "object",
+                    "description": "Optional extraction schema for structured data"
+                },
+                "force_refresh": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Force fresh scraping, bypassing cache"
                 }
             },
-            "required": ["url", "session_id"]
+            "required": ["url"]
         })
+    }
+
+    async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+        self.execute_internal(parameters).await
     }
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
@@ -45,6 +76,11 @@ impl Tool for Scraper {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| BrightDataError::ToolError("Missing 'url' parameter".into()))?;
+
+        let session_id = parameters
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BrightDataError::ToolError("Missing 'user_id' parameter".into()))?;
 
         let data_type = parameters
             .get("data_type")
@@ -61,12 +97,64 @@ impl Tool for Scraper {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
+        let force_refresh = parameters
+            .get("force_refresh")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let schema = parameters.get("schema").cloned();
 
         let execution_id = self.generate_execution_id();
         
+        info!("🌐 Scraping request: '{}' (session: {}, type: {}, format: {})", 
+              url, session_id, data_type, extraction_format);
+        
+        // 🎯 CACHE CHECK - Check Redis cache first (unless force_refresh=true)
+        if !force_refresh {
+            match self.check_cache_first(url, session_id).await {
+                Ok(Some(cached_result)) => {
+                    info!("🚀 Cache HIT: Returning cached data for {} in session {}", url, session_id);
+                    
+                    // Create tool result from cached data
+                    let content = cached_result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let source_used = "Cache";
+                    let method_used = "Redis Cache";
+                    
+                    let formatted_response = self.create_formatted_scrape_response(
+                        url, data_type, extraction_format, content, &execution_id
+                    );
+                    
+                    let tool_result = ToolResult::success_with_raw(
+                        vec![McpContent::text(formatted_response)], 
+                        cached_result
+                    );
+                    
+                    // Apply filtering only if DEDUCT_DATA=true
+                    if self.is_data_reduction_enabled() {
+                        return Ok(ResponseStrategy::apply_size_limits(tool_result));
+                    } else {
+                        return Ok(tool_result);
+                    }
+                }
+                Ok(None) => {
+                    info!("💾 Cache MISS: Fetching fresh data for {} in session {}", url, session_id);
+                }
+                Err(e) => {
+                    warn!("🚨 Cache error (continuing with fresh fetch): {}", e);
+                }
+            }
+        } else {
+            info!("🔄 Force refresh requested, bypassing cache for {}", url);
+        }
+
+        // 🌐 FRESH FETCH - Cache miss or force refresh, fetch from BrightData
         match self.scrape_with_brightdata(url, data_type, extraction_format, clean_content, schema, &execution_id).await {
             Ok(result) => {
+                // 🗄️ CACHE STORE - Store successful result in cache
+                if let Err(e) = self.store_in_cache(url, session_id, &result).await {
+                    warn!("Failed to store result in cache: {}", e);
+                }
+                
                 let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
                 
                 // Create formatted response based on DEDUCT_DATA setting
@@ -88,12 +176,14 @@ impl Tool for Scraper {
             }
             Err(_e) => {
                 // Return empty data for BrightData errors - Anthropic will retry
+                warn!("BrightData error for URL '{}', returning empty data for retry", url);
                 let empty_response = json!({
                     "url": url,
                     "data_type": data_type,
                     "status": "no_data",
                     "reason": "brightdata_error",
-                    "execution_id": execution_id
+                    "execution_id": execution_id,
+                    "session_id": session_id
                 });
                 
                 Ok(ToolResult::success_with_raw(
@@ -106,14 +196,14 @@ impl Tool for Scraper {
 }
 
 impl Scraper {
-    /// Check if data reduction is enabled via DEDUCT_DATA environment variable only
+    /// ENHANCED: Check if data reduction is enabled via DEDUCT_DATA environment variable only
     fn is_data_reduction_enabled(&self) -> bool {
         std::env::var("DEDUCT_DATA")
             .unwrap_or_else(|_| "false".to_string())
             .to_lowercase() == "true"
     }
 
-    /// Create formatted response with DEDUCT_DATA control
+    /// ENHANCED: Create formatted response with DEDUCT_DATA control
     fn create_formatted_scrape_response(
         &self,
         url: &str,
@@ -150,7 +240,95 @@ impl Scraper {
         format!("scrape_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"))
     }
 
-    /// Extract data with BrightData using only WEB_UNLOCKER_ZONE
+    // 🎯 ADDED: Check Redis cache first
+    async fn check_cache_first(
+        &self,
+        url: &str,
+        session_id: &str,
+    ) -> Result<Option<Value>, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.get_cached_scrape_data(session_id, url).await
+    }
+
+    // 🗄️ ADDED: Store successful result in Redis cache
+    async fn store_in_cache(
+        &self,
+        url: &str,
+        session_id: &str,
+        data: &Value,
+    ) -> Result<(), BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.cache_scrape_data(session_id, url, data.clone()).await
+    }
+
+    // 🔍 ADDED: Get all cached URLs for session (useful for finding related content)
+    pub async fn get_session_cached_urls(&self, session_id: &str) -> Result<Vec<String>, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.get_session_scrape_urls(session_id).await
+    }
+
+    // 🔍 ADDED: Get cached URLs by domain
+    pub async fn get_cached_urls_by_domain(
+        &self,
+        session_id: &str,
+        domain: &str,
+    ) -> Result<Vec<String>, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.get_cached_urls_by_domain(session_id, domain).await
+    }
+
+    // 🗑️ ADDED: Clear cache for specific URL
+    pub async fn clear_url_cache(
+        &self,
+        url: &str,
+        session_id: &str,
+    ) -> Result<(), BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.clear_scrape_url_cache(session_id, url).await
+    }
+
+    // 🗑️ ADDED: Clear entire session cache
+    pub async fn clear_session_cache(&self, session_id: &str) -> Result<u32, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.clear_session_scrape_cache(session_id).await
+    }
+
+    // 📊 ADDED: Get cache statistics
+    pub async fn get_cache_stats(&self) -> Result<Value, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.get_scrape_cache_stats().await
+    }
+
+    // 📊 ADDED: Get cache summary for session
+    pub async fn get_cache_summary(&self, session_id: &str) -> Result<Value, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.get_cache_summary(session_id).await
+    }
+
+    // 🏥 ADDED: Enhanced connectivity test including cache
+    pub async fn test_connectivity_with_cache(&self) -> Result<String, BrightDataError> {
+        let mut results = Vec::new();
+        
+        // Test cache connectivity
+        info!("🧪 Testing Redis Cache...");
+        match get_scrape_cache().await {
+            Ok(cache_service) => {
+                match cache_service.health_check().await {
+                    Ok(_) => results.push("✅ Redis Cache: SUCCESS".to_string()),
+                    Err(e) => results.push(format!("❌ Redis Cache: FAILED - {}", e)),
+                }
+            }
+            Err(e) => results.push(format!("❌ Redis Cache: FAILED - {}", e)),
+        }
+        
+        // Test existing connectivity
+        let api_test = self.test_connectivity().await?;
+        results.push(api_test);
+        
+        Ok(format!("🔍 Enhanced Connectivity Test Results:\n{}", results.join("\n")))
+    }
+
+    /// ENHANCED: Extract data with BrightData using only WEB_UNLOCKER_ZONE
     async fn scrape_with_brightdata(
         &self,
         url: &str,
@@ -268,7 +446,7 @@ impl Scraper {
         println!("END OF CONTENT SENT TO ANTHROPIC");
         println!("--------------------------------------------------------------------------");
 
-        // Return raw content directly without processing
+        // Return enhanced result with additional metadata
         Ok(json!({
             "content": raw_content,
             "metadata": {
@@ -279,9 +457,50 @@ impl Scraper {
                 "extraction_format": extraction_format,
                 "clean_content": clean_content,
                 "data_format": "markdown",
-                "data_reduction_enabled": self.is_data_reduction_enabled()
+                "data_reduction_enabled": self.is_data_reduction_enabled(),
+                "status_code": status,
+                "content_size_bytes": raw_content.len(),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "payload_used": payload
             },
             "success": true
         }))
+    }
+
+    /// Test BrightData connectivity
+    pub async fn test_connectivity(&self) -> Result<String, BrightDataError> {
+        let test_url = "https://httpbin.org/json";
+        let mut results = Vec::new();
+        
+        // Test BrightData API
+        info!("🧪 Testing BrightData Web Unlocker...");
+        match self.scrape_with_brightdata(
+            test_url, "auto", "structured", true, None, "connectivity_test"
+        ).await {
+            Ok(_) => {
+                results.push("✅ BrightData Web Unlocker: SUCCESS".to_string());
+            }
+            Err(e) => {
+                results.push(format!("❌ BrightData Web Unlocker: FAILED - {}", e));
+            }
+        }
+        
+        Ok(format!("🔍 Connectivity Test Results:\n{}", results.join("\n")))
+    }
+
+    /// Check if URL is cached
+    pub async fn is_url_cached(&self, session_id: &str, url: &str) -> Result<bool, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.is_url_cached(session_id, url).await
+    }
+
+    /// Batch cache multiple URLs (useful for bulk operations)
+    pub async fn batch_cache_urls(
+        &self,
+        session_id: &str,
+        url_data: Vec<(String, Value)>, // Vec<(url, data)>
+    ) -> Result<Vec<String>, BrightDataError> {
+        let cache_service = get_scrape_cache().await?;
+        cache_service.batch_cache_scrape_data(session_id, url_data).await
     }
 }
