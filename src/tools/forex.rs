@@ -1,10 +1,10 @@
-// src/tools/commodity.rs
+// src/tools/forex.rs
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
 use crate::extras::logger::JSON_LOGGER;
 use crate::metrics::brightdata_logger::BRIGHTDATA_METRICS;
-use crate::services::cache::commodity_cache::get_commodity_cache;
+use crate::services::cache::forex_cache::get_forex_cache;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -12,7 +12,7 @@ use std::env;
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use log::{info, warn, error};
-use crate::symbols::commodity_symbol::match_symbol_from_query;
+use crate::symbols::forex_symbol::match_symbol_from_query;
 
 // Struct to organize URLs by method
 #[derive(Debug, Clone)]
@@ -21,16 +21,16 @@ pub struct MethodUrls {
     pub direct: Vec<(String, String)>, // (url, description)
 }
 
-pub struct CommodityDataTool;
+pub struct ForexDataTool;
 
 #[async_trait]
-impl Tool for CommodityDataTool {
+impl Tool for ForexDataTool {
     fn name(&self) -> &str {
-        "get_commodity_data"
+        "get_forex_data"
     }
 
     fn description(&self) -> &str {
-        "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}.MCX/ (e.g., CRUDEOIL.MCX, CRUDEOILM.MCX)."
+        "Get comprehensive Forex snapshot (spot rate, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}=X/ (e.g., USDINR=X)."
     }
 
     fn input_schema(&self) -> Value {
@@ -39,11 +39,11 @@ impl Tool for CommodityDataTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Commodity/futures symbol (e.g., CRUDEOIL, CRUDEOIL, NATURALGAS). Used if 'symbol' missing."
+                    "description": "Forex pair (e.g., USDINR, EURUSD, USD/JPY). Used if 'symbol' missing."
                 },
                 "symbol": {
                     "type": "string",
-                    "description": "Commodity/futures symbol (e.g., CRUDEOIL, CRUDEOIL, NATURALGAS). Used if 'symbol' missing."
+                    "description": "Forex pair (e.g., USDINR, EURUSD, GBPUSD, USDJPY)"
                 },
                 "data_type": {
                     "type": "string",
@@ -116,7 +116,7 @@ impl Tool for CommodityDataTool {
         let query_priority = ResponseStrategy::classify_query_priority(query);
         let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
 
-        let execution_id = format!("commodity_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+        let execution_id = format!("forex_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
         
         info!("📈 Stock query: '{}' (market: {}, priority: {:?}, tokens: {}, session: {})", 
               query, market, query_priority, recommended_tokens, session_id);
@@ -131,7 +131,7 @@ impl Tool for CommodityDataTool {
                 let source_used = cached_result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Cache");
                 let method_used = "Redis Cache";
                 
-                let formatted_response = self.create_formatted_commodity_response(
+                let formatted_response = self.create_formatted_forex_response(
                     query, market, content, source_used, method_used, 
                     data_type, timeframe, include_ratios, include_volume, &execution_id
                 );
@@ -157,7 +157,7 @@ impl Tool for CommodityDataTool {
         }
 
         // 🌐 FRESH FETCH - Cache miss, fetch from sources
-        match self.fetch_commodity_data_with_fallbacks_and_priority(
+        match self.fetch_forex_data_with_fallbacks_and_priority(
             query, market, data_type, timeframe, include_ratios, include_volume,
             query_priority, recommended_tokens, &execution_id
         ).await {
@@ -172,7 +172,7 @@ impl Tool for CommodityDataTool {
                 let method_used = result.get("method_used").and_then(|m| m.as_str()).unwrap_or("Unknown");
                 
                 // Create formatted response based on DEDUCT_DATA setting
-                let formatted_response = self.create_formatted_commodity_response(
+                let formatted_response = self.create_formatted_forex_response(
                     query, market, content, source_used, method_used, 
                     data_type, timeframe, include_ratios, include_volume, &execution_id
                 );
@@ -202,7 +202,7 @@ impl Tool for CommodityDataTool {
                 });
                 
                 Ok(ToolResult::success_with_raw(
-                    vec![McpContent::text("📈 **No Data Available**\n\nPlease try again with a more specific commodity symbol.".to_string())],
+                    vec![McpContent::text("📈 **No Data Available**\n\nPlease try again with a more specific forex symbol.".to_string())],
                     empty_response
                 ))
             }
@@ -210,7 +210,7 @@ impl Tool for CommodityDataTool {
     }
 }
 
-impl CommodityDataTool {
+impl ForexDataTool {
     /// ENHANCED: Check if data reduction is enabled via DEDUCT_DATA environment variable only
     fn is_data_reduction_enabled(&self) -> bool {
         std::env::var("DEDUCT_DATA")
@@ -219,7 +219,7 @@ impl CommodityDataTool {
     }
 
     /// ENHANCED: Create formatted response with DEDUCT_DATA control
-    fn create_formatted_commodity_response(
+    fn create_formatted_forex_response(
         &self,
         query: &str,
         market: &str, 
@@ -260,9 +260,9 @@ impl CommodityDataTool {
         )
     }
     
-    /// TODO: Extract essential commodity data using existing filter methods
-    fn extract_essential_commodity_data(&self, content: &str, query: &str) -> String {
-        // TODO: Add essential commodity data extraction logic
+    /// TODO: Extract essential forex data using existing filter methods
+    fn extract_essential_forex_data(&self, content: &str, query: &str) -> String {
+        // TODO: Add essential forex data extraction logic
         // For now, return original content
         content.to_string()
     }
@@ -287,8 +287,8 @@ impl CommodityDataTool {
         query: &str,
         session_id: &str,
     ) -> Result<Option<Value>, BrightDataError> {
-        let cache_service = get_commodity_cache().await?;
-        cache_service.get_cached_commodity_data(session_id, query).await
+        let cache_service = get_forex_cache().await?;
+        cache_service.get_cached_forex_data(session_id, query).await
     }
 
     // 🗄️ ADDED: Store successful result in Redis cache
@@ -298,14 +298,14 @@ impl CommodityDataTool {
         session_id: &str,
         data: &Value,
     ) -> Result<(), BrightDataError> {
-        let cache_service = get_commodity_cache().await?;
-        cache_service.cache_commodity_data(session_id, query, data.clone()).await
+        let cache_service = get_forex_cache().await?;
+        cache_service.cache_forex_data(session_id, query, data.clone()).await
     }
 
     // 🔍 ADDED: Get all cached symbols for session (useful for comparisons)
     pub async fn get_session_cached_symbols(&self, session_id: &str) -> Result<Vec<String>, BrightDataError> {
-        let cache_service = get_commodity_cache().await?;
-        cache_service.get_session_commodity_symbols(session_id).await
+        let cache_service = get_forex_cache().await?;
+        cache_service.get_session_forex_symbols(session_id).await
     }
 
     // 🗑️ ADDED: Clear cache for specific symbol
@@ -314,20 +314,20 @@ impl CommodityDataTool {
         symbol: &str,
         session_id: &str,
     ) -> Result<(), BrightDataError> {
-        let cache_service = get_commodity_cache().await?;
-        cache_service.clear_commodity_symbol_cache(session_id, symbol).await
+        let cache_service = get_forex_cache().await?;
+        cache_service.clear_forex_symbol_cache(session_id, symbol).await
     }
 
     // 🗑️ ADDED: Clear entire session cache
     pub async fn clear_session_cache(&self, session_id: &str) -> Result<u32, BrightDataError> {
-        let cache_service = get_commodity_cache().await?;
-        cache_service.clear_session_commodity_cache(session_id).await
+        let cache_service = get_forex_cache().await?;
+        cache_service.clear_session_forex_cache(session_id).await
     }
 
     // 📊 ADDED: Get cache statistics
     pub async fn get_cache_stats(&self) -> Result<Value, BrightDataError> {
-        let cache_service = get_commodity_cache().await?;
-        cache_service.get_commodity_cache_stats().await
+        let cache_service = get_forex_cache().await?;
+        cache_service.get_forex_cache_stats().await
     }
 
     // 🏥 ADDED: Enhanced connectivity test including cache
@@ -336,7 +336,7 @@ impl CommodityDataTool {
         
         // Test cache connectivity
         info!("🧪 Testing Redis Cache...");
-        match get_commodity_cache().await {
+        match get_forex_cache().await {
             Ok(cache_service) => {
                 match cache_service.health_check().await {
                     Ok(_) => results.push("✅ Redis Cache: SUCCESS".to_string()),
@@ -368,11 +368,11 @@ impl CommodityDataTool {
         // Add priority-based URL limiting
         let max_sources = 3;
 
-        if self.is_likely_commodity_symbol(&clean_query) {
+        if self.is_likely_forex_symbol(&clean_query) {
             match market {
                 "usd" => {
                     let symbols_to_try = vec![
-                        format!("{}.MCX", clean_query),
+                        format!("{}=X", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -392,7 +392,7 @@ impl CommodityDataTool {
                 },
                 "inr" => {
                     let symbols_to_try = vec![
-                        format!("{}", clean_query),
+                        format!("{}=X", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -413,7 +413,7 @@ impl CommodityDataTool {
 
                 _ => {
                     let symbols_to_try = vec![
-                        format!("{}", clean_query),
+                        format!("{}=X", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -457,7 +457,7 @@ impl CommodityDataTool {
     }
 
     /// ENHANCED: Main fetch function with method-separated URL structure
-    async fn fetch_commodity_data_with_fallbacks_and_priority(
+    async fn fetch_forex_data_with_fallbacks_and_priority(
         &self, 
         query: &str, 
         market: &str, 
@@ -552,7 +552,7 @@ impl CommodityDataTool {
                         result["successful_method_sequence"] = json!(method_sequence + 1);
                         result["successful_url_sequence"] = json!(url_sequence + 1);
                         
-                        info!("✅ Successfully fetched commodity data from {} via {} (method: {}, url: {})", 
+                        info!("✅ Successfully fetched forex data from {} via {} (method: {}, url: {})", 
                               source_name, method_name, method_sequence + 1, url_sequence + 1);
                         
                         return Ok(result);
@@ -675,7 +675,7 @@ impl CommodityDataTool {
             // Handle server errors with retry
             if matches!(status, 502 | 503 | 504) && retry_attempt < max_retries - 1 {
                 let wait_time = Duration::from_millis(1000 + (retry_attempt as u64 * 1000));
-                warn!("⏳ Direct API: Server error {}, waiting {} ms before retry...", status, wait_time.as_millis());
+                warn!("⏳ Direct API: Server error {}, waiting {}ms before retry...", status, wait_time.as_millis());
                 tokio::time::sleep(wait_time).await;
                 last_error = Some(BrightDataError::ToolError(format!("Direct API server error: {}", status)));
                 continue;
@@ -950,7 +950,7 @@ impl CommodityDataTool {
         Err(last_error.unwrap_or_else(|| BrightDataError::ToolError("Proxy: All retry attempts failed".into())))
     }
 
-    fn is_likely_commodity_symbol(&self, query: &str) -> bool {
+    fn is_likely_forex_symbol(&self, query: &str) -> bool {
         let clean = query.trim();
         
         if clean.len() < 1 || clean.len() > 15 {

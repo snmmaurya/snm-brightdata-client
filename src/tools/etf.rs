@@ -1,14 +1,25 @@
-// src/tools/etf.rs - PATCHED: Enhanced with priority-aware filtering and token budget management
+// src/tools/etf.rs
 use crate::tool::{Tool, ToolResult, McpContent};
 use crate::error::BrightDataError;
-use crate::extras::logger::JSON_LOGGER;
 use crate::filters::{ResponseFilter, ResponseStrategy, ResponseType};
+use crate::extras::logger::JSON_LOGGER;
+use crate::metrics::brightdata_logger::BRIGHTDATA_METRICS;
+use crate::services::cache::etf_cache::get_etf_cache;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::env;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use log::{info, warn, error};
+use crate::symbols::etf_symbol::match_symbol_from_query;
+
+// Struct to organize URLs by method
+#[derive(Debug, Clone)]
+pub struct MethodUrls {
+    pub proxy: Vec<(String, String)>,  // (url, description)
+    pub direct: Vec<(String, String)>, // (url, description)
+}
 
 pub struct ETFDataTool;
 
@@ -19,7 +30,7 @@ impl Tool for ETFDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get ETF and index fund data with enhanced search parameters including NAV, holdings, performance, expense ratios"
+        "Get comprehensive ETF snapshot (price, summary, metrics) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}.NS/ (e.g., NIFTYBEES)."
     }
 
     fn input_schema(&self) -> Value {
@@ -28,665 +39,849 @@ impl Tool for ETFDataTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "ETF symbol (SPY, NIFTYBEES), ETF name, or ETF market analysis query"
+                    "description": "ETF ticker or name (e.g., NIFTYBEES, JUNIORBEES). If provided, used when 'symbol' missing."
                 },
-                "market": {
+                "symbol": {
                     "type": "string",
-                    "enum": ["indian", "us", "global"],
-                    "default": "indian",
-                    "description": "Market region"
+                    "description": "ETF ticker (e.g., NIFTYBEES, JUNIORBEES, GOLDBEES)"
                 },
-                "page": {
-                    "type": "integer",
-                    "description": "Page number for pagination (1-based)",
-                    "minimum": 1,
-                    "default": 1
-                },
-                "num_results": {
-                    "type": "integer",
-                    "description": "Number of results per page (10-100)",
-                    "minimum": 10,
-                    "maximum": 100,
-                    "default": 20
-                },
-                "time_filter": {
+                "data_type": {
                     "type": "string",
-                    "enum": ["any", "day", "week", "month", "year"],
-                    "description": "Time-based filter for ETF performance data",
-                    "default": "any"
+                    "enum": ["price", "fundamentals", "technical", "news", "all"],
+                    "default": "all",
+                    "description": "Focus slice for parsing/formatting"
                 },
-                "etf_type": {
+                "timeframe": {
                     "type": "string",
-                    "enum": ["any", "equity", "bond", "commodity", "sector", "index"],
-                    "description": "Type of ETF to search for",
-                    "default": "any"
+                    "enum": ["realtime", "day", "week", "month", "quarter", "year"],
+                    "default": "realtime",
+                    "description": "Time period context for analysis"
                 },
-                "data_points": {
-                    "type": "array",
-                    "items": {
-                        "type": "string",
-                        "enum": ["price", "nav", "holdings", "performance", "expense_ratio", "volume", "dividend"]
-                    },
-                    "description": "Specific data points to focus on",
-                    "default": ["price", "nav", "performance"]
-                },
-                "use_serp_api": {
+                "include_ratios": {
                     "type": "boolean",
-                    "description": "Use enhanced SERP API with advanced parameters",
-                    "default": true
+                    "default": true,
+                    "description": "Include ratios/metrics if available"
+                },
+                "include_volume": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "Include volume/liquidity info if available"
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "Session/user id for cache scoping"
                 }
             },
-            "required": ["query"]
+            "required": ["symbol", "user_id"]
         })
     }
 
-    // FIXED: Remove the execute method override to use the default one with metrics logging
-    // async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
-    //     self.execute_internal(parameters).await
-    // }
+    async fn execute(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
+        self.execute_internal(parameters).await
+    }
 
     async fn execute_internal(&self, parameters: Value) -> Result<ToolResult, BrightDataError> {
-        let query = parameters
-            .get("query")
+        let raw_query = parameters
+            .get("symbol")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| BrightDataError::ToolError("Missing 'query' parameter".into()))?;
-        
+            .ok_or_else(|| BrightDataError::ToolError("Missing 'symbol' parameter".into()))?;
+
+        let session_id = parameters
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| BrightDataError::ToolError("Missing 'user_id' parameter".into()))?;
+
+        // Step 1: Resolve known symbols (or fallback)
+        let matched_symbol = match_symbol_from_query(raw_query);
+
+        // Step 2: Strip trailing .com / .xyz etc.
+        let query = matched_symbol.split('.').next().unwrap_or(&matched_symbol);
+
         let market = parameters
             .get("market")
             .and_then(|v| v.as_str())
-            .unwrap_or("indian");
+            .unwrap_or("usd");
 
-        let page = parameters
-            .get("page")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(1) as u32;
-
-        let num_results = parameters
-            .get("num_results")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(20) as u32;
-
-        let time_filter = parameters
-            .get("time_filter")
+        let data_type = parameters
+            .get("data_type")
             .and_then(|v| v.as_str())
-            .unwrap_or("any");
+            .unwrap_or("all");
 
-        let etf_type = parameters
-            .get("etf_type")
+        let timeframe = parameters
+            .get("timeframe")
             .and_then(|v| v.as_str())
-            .unwrap_or("any");
+            .unwrap_or("realtime");
 
-        let data_points = parameters
-            .get("data_points")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
-            .unwrap_or_else(|| vec!["price", "nav", "performance"]);
-
-        let use_serp_api = parameters
-            .get("use_serp_api")
+        let include_ratios = parameters
+            .get("include_ratios")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        // ENHANCED: Priority classification and token allocation
+        let include_volume = parameters
+            .get("include_volume")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
         let query_priority = ResponseStrategy::classify_query_priority(query);
         let recommended_tokens = ResponseStrategy::get_recommended_token_allocation(query);
 
-        // Early validation using strategy only if TRUNCATE_FILTER is enabled
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            // Budget check for ETF queries
-            let (_, remaining_tokens) = ResponseStrategy::get_token_budget_status();
-            if remaining_tokens < 150 && !matches!(query_priority, crate::filters::strategy::QueryPriority::Critical) {
-                return Ok(ResponseStrategy::create_response("", query, "etf", "budget_limit", json!({}), ResponseType::Skip));
+        let execution_id = format!("etf_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
+        
+        info!("📈 ETF query: '{}' (market: {}, priority: {:?}, tokens: {}, session: {})", 
+              query, market, query_priority, recommended_tokens, session_id);
+        
+        // 🎯 CACHE CHECK - Check Redis cache first
+        match self.check_cache_first(query, session_id).await {
+            Ok(Some(cached_result)) => {
+                info!("🚀 Cache HIT: Returning cached data for {} in session {}", query, session_id);
+                
+                // Create tool result from cached data
+                let content = cached_result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let source_used = cached_result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Cache");
+                let method_used = "Redis Cache";
+                
+                let formatted_response = self.create_formatted_etf_response(
+                    query, market, content, source_used, method_used, 
+                    data_type, timeframe, include_ratios, include_volume, &execution_id
+                );
+                
+                let tool_result = ToolResult::success_with_raw(
+                    vec![McpContent::text(formatted_response)], 
+                    cached_result
+                );
+                
+                // Apply filtering only if DEDUCT_DATA=true
+                if self.is_data_reduction_enabled() {
+                    return Ok(ResponseStrategy::apply_size_limits(tool_result));
+                } else {
+                    return Ok(tool_result);
+                }
+            }
+            Ok(None) => {
+                info!("💾 Cache MISS: Fetching fresh data for {} in session {}", query, session_id);
+            }
+            Err(e) => {
+                warn!("🚨 Cache error (continuing with fresh fetch): {}", e);
             }
         }
 
-        let execution_id = format!("etf_{}", chrono::Utc::now().format("%Y%m%d_%H%M%S%.3f"));
-        
-        let result = if use_serp_api {
-            self.fetch_etf_data_enhanced_with_priority(
-                query, market, page, num_results, time_filter, etf_type, &data_points, 
-                query_priority, recommended_tokens, &execution_id
-            ).await?
-        } else {
-            self.fetch_etf_data_legacy_with_priority(query, market, query_priority, recommended_tokens, &execution_id).await?
-        };
-
-        let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        let source_used = if use_serp_api { "Enhanced SERP" } else { "Legacy" };
-
-        // Create appropriate response based on whether filtering is enabled
-        let tool_result = if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            ResponseStrategy::create_financial_response(
-                "etf", query, market, source_used, content, result.clone()
-            )
-        } else {
-            // No filtering - create standard response
-            let content_text = if use_serp_api {
-                result.get("formatted_content").and_then(|c| c.as_str()).unwrap_or(content)
-            } else {
-                content
-            };
-            
-            let mcp_content = if use_serp_api {
-                vec![McpContent::text(format!(
-                    "📊 **Enhanced ETF Data for {}**\n\nMarket: {} | ETF Type: {} | Data Points: {:?} | Priority: {:?} | Tokens: {}\nPage: {} | Results: {} | Time Filter: {}\nExecution ID: {}\n\n{}",
-                    query,
-                    market.to_uppercase(),
-                    etf_type,
-                    data_points,
-                    query_priority,
-                    recommended_tokens,
-                    page,
-                    num_results,
-                    time_filter,
-                    execution_id,
-                    content_text
-                ))]
-            } else {
-                vec![McpContent::text(format!(
-                    "📊 **ETF Data for {}**\n\nMarket: {} | Priority: {:?} | Tokens: {}\nExecution ID: {}\n\n{}",
-                    query,
-                    market.to_uppercase(),
-                    query_priority,
-                    recommended_tokens,
-                    execution_id,
-                    content_text
-                ))]
-            };
-            ToolResult::success_with_raw(mcp_content, result)
-        };
-
-        // Apply size limits only if filtering enabled
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            Ok(ResponseStrategy::apply_size_limits(tool_result))
-        } else {
-            Ok(tool_result)
+        // 🌐 FRESH FETCH - Cache miss, fetch from sources
+        match self.fetch_etf_data_with_fallbacks_and_priority(
+            query, market, data_type, timeframe, include_ratios, include_volume,
+            query_priority, recommended_tokens, &execution_id
+        ).await {
+            Ok(result) => {
+                // 🗄️ CACHE STORE - Store successful result in cache
+                if let Err(e) = self.store_in_cache(query, session_id, &result).await {
+                    warn!("Failed to store result in cache: {}", e);
+                }
+                
+                let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                let source_used = result.get("source_used").and_then(|s| s.as_str()).unwrap_or("Unknown");
+                let method_used = result.get("method_used").and_then(|m| m.as_str()).unwrap_or("Unknown");
+                
+                // Create formatted response based on DEDUCT_DATA setting
+                let formatted_response = self.create_formatted_etf_response(
+                    query, market, content, source_used, method_used, 
+                    data_type, timeframe, include_ratios, include_volume, &execution_id
+                );
+                
+                let tool_result = ToolResult::success_with_raw(
+                    vec![McpContent::text(formatted_response)], 
+                    result
+                );
+                
+                // Apply filtering only if DEDUCT_DATA=true
+                if self.is_data_reduction_enabled() {
+                    Ok(ResponseStrategy::apply_size_limits(tool_result))
+                } else {
+                    Ok(tool_result)
+                }
+            }
+            Err(_e) => {
+                // Return empty data for BrightData errors - Anthropic will retry
+                warn!("BrightData error for query '{}', returning empty data for retry", query);
+                let empty_response = json!({
+                    "query": query,
+                    "market": market,
+                    "status": "no_data",
+                    "reason": "brightdata_error",
+                    "execution_id": execution_id,
+                    "session_id": session_id
+                });
+                
+                Ok(ToolResult::success_with_raw(
+                    vec![McpContent::text("📈 **No Data Available**\n\nPlease try again with a more specific ETF symbol.".to_string())],
+                    empty_response
+                ))
+            }
         }
     }
 }
 
 impl ETFDataTool {
-    // ENHANCED: Priority-aware ETF data fetching with token management
-    async fn fetch_etf_data_enhanced_with_priority(
+    /// ENHANCED: Check if data reduction is enabled via DEDUCT_DATA environment variable only
+    fn is_data_reduction_enabled(&self) -> bool {
+        std::env::var("DEDUCT_DATA")
+            .unwrap_or_else(|_| "false".to_string())
+            .to_lowercase() == "true"
+    }
+
+    /// ENHANCED: Create formatted response with DEDUCT_DATA control
+    fn create_formatted_etf_response(
+        &self,
+        query: &str,
+        market: &str, 
+        content: &str,
+        source: &str,
+        method: &str,
+        data_type: &str,
+        timeframe: &str,
+        include_ratios: bool,
+        include_volume: bool,
+        execution_id: &str
+    ) -> String {
+        // If DEDUCT_DATA=false, return full content with basic formatting
+        if !self.is_data_reduction_enabled() {
+            return format!(
+                "📈 **{}** | {} Market\n\n## Full Content\n{}\n\n*Source: {} via {} • Type: {} • Period: {}*",
+                query.to_uppercase(), 
+                market.to_uppercase(), 
+                content,
+                source, 
+                method, 
+                data_type, 
+                timeframe
+            );
+        }
+
+        // TODO: Add filtered data extraction logic when DEDUCT_DATA=true
+        // For now, return full content formatted
+        format!(
+            "📈 **{}** | {} Market\n\n## Content (TODO: Add Filtering)\n{}\n\n*Source: {} via {} • Type: {} • Period: {}*",
+            query.to_uppercase(), 
+            market.to_uppercase(), 
+            content,
+            source, 
+            method, 
+            data_type, 
+            timeframe
+        )
+    }
+
+    // 🎯 ADDED: Check Redis cache first
+    async fn check_cache_first(
+        &self,
+        query: &str,
+        session_id: &str,
+    ) -> Result<Option<Value>, BrightDataError> {
+        let cache_service = get_etf_cache().await?;
+        cache_service.get_cached_etf_data(session_id, query).await
+    }
+
+    // 🗄️ ADDED: Store successful result in Redis cache
+    async fn store_in_cache(
+        &self,
+        query: &str,
+        session_id: &str,
+        data: &Value,
+    ) -> Result<(), BrightDataError> {
+        let cache_service = get_etf_cache().await?;
+        cache_service.cache_etf_data(session_id, query, data.clone()).await
+    }
+
+    /// ENHANCED: Build URLs separated by method (proxy vs direct)
+    fn build_prioritized_urls_with_priority(
         &self, 
         query: &str, 
         market: &str, 
-        page: u32,
-        num_results: u32,
-        time_filter: &str,
-        etf_type: &str,
-        data_points: &[&str],
+        data_type: &str,
+        priority: crate::filters::strategy::QueryPriority
+    ) -> MethodUrls {
+        let mut proxy_urls = Vec::new();
+        let mut direct_urls = Vec::new();
+        let clean_query = query.trim().to_uppercase();
+
+        // Add priority-based URL limiting
+        let max_sources = 3;
+
+        if self.is_likely_etf_symbol(&clean_query) {
+            match market {
+                "usd" => {
+                    let symbols_to_try = vec![
+                        format!("{}.NS", clean_query),
+                        clean_query.clone(),
+                    ];
+                    
+                    for (i, symbol) in symbols_to_try.iter().enumerate() {
+                        if i >= max_sources { break; }
+                        
+                        let url = format!("https://finance.yahoo.com/quote/{}", symbol);
+                        let description = format!("Yahoo Finance ({})", symbol);
+
+                        let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
+                        let proxy_description = format!("Yahoo Finance ({})", symbol);
+                        
+                        // Add to both proxy and direct (same URLs, different methods)
+                        proxy_urls.push((proxy_url, proxy_description));
+                        direct_urls.push((url, description));
+                    }
+                },
+                "inr" => {
+                    let symbols_to_try = vec![
+                        format!("{}.NS", clean_query),
+                        clean_query.clone(),
+                    ];
+                    
+                    for (i, symbol) in symbols_to_try.iter().enumerate() {
+                        if i >= max_sources { break; }
+                        
+                        let url = format!("https://finance.yahoo.com/quote/{}", symbol);
+                        let description = format!("Yahoo Finance ({})", symbol);
+
+                        let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
+                        let proxy_description = format!("Yahoo Finance ({})", symbol);
+                        
+                        // Add to both proxy and direct (same URLs, different methods)
+                        proxy_urls.push((proxy_url, proxy_description));
+                        direct_urls.push((url, description));
+                    }
+                }
+
+                _ => {
+                    let symbols_to_try = vec![
+                        format!("{}.NS", clean_query),
+                        clean_query.clone(),
+                    ];
+                    
+                    for (i, symbol) in symbols_to_try.iter().enumerate() {
+                        if i >= max_sources { break; }
+                        
+                        let url = format!("https://finance.yahoo.com/quote/{}", symbol);
+                        let description = format!("Yahoo Finance ({})", symbol);
+
+                        let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
+                        let proxy_description = format!("Yahoo Finance ({})", symbol);
+                        
+                        // Add to both proxy and direct (same URLs, different methods)
+                        proxy_urls.push((proxy_url, proxy_description));
+                        direct_urls.push((url, description));
+                    }
+                }
+
+            }
+        }
+
+        // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
+        if proxy_urls.len() < max_sources {
+            let url = format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query));
+            let description = "Yahoo Finance Search".to_string();
+
+            let proxy_url = format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query));
+            let proxy_description = "Yahoo Finance Search".to_string();
+            
+            proxy_urls.push((proxy_url, proxy_description));
+            direct_urls.push((url, description));
+        }
+
+        info!("🎯 Generated {} proxy URLs and {} direct URLs for query '{}' (priority: {:?})", 
+              proxy_urls.len(), direct_urls.len(), query, priority);
+        
+        MethodUrls {
+            proxy: proxy_urls,
+            direct: direct_urls,
+        }
+    }
+
+    /// ENHANCED: Main fetch function with method-separated URL structure
+    async fn fetch_etf_data_with_fallbacks_and_priority(
+        &self, 
+        query: &str, 
+        market: &str, 
+        data_type: &str,
+        timeframe: &str,
+        include_ratios: bool,
+        include_volume: bool,
         query_priority: crate::filters::strategy::QueryPriority,
         token_budget: usize,
         execution_id: &str
     ) -> Result<Value, BrightDataError> {
-        let api_token = env::var("BRIGHTDATA_API_TOKEN")
-            .or_else(|_| env::var("API_TOKEN"))
-            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
+        let method_urls = self.build_prioritized_urls_with_priority(query, market, data_type, query_priority);
+        let mut last_error = None;
+        let mut attempts = Vec::new();
 
-        let base_url = env::var("BRIGHTDATA_BASE_URL")
-            .unwrap_or_else(|_| "https://api.brightdata.com".to_string());
+        // Define method priority: try direct first, then proxy
+        let methods_to_try = vec![
+            // ("direct", "Direct Call", &method_urls.direct),
+            ("proxy", "Proxy Fallback", &method_urls.proxy)
+        ];
 
-        let zone = env::var("BRIGHTDATA_SERP_ZONE")
-            .unwrap_or_else(|_| "serp_api2".to_string());
+        for (method_sequence, (method_type, method_name, urls_for_method)) in methods_to_try.iter().enumerate() {
+            info!("🔄 Trying {} method with {} URLs", method_name, urls_for_method.len());
+            
+            for (url_sequence, (url, source_name)) in urls_for_method.iter().enumerate() {
+                let attempt_result = match *method_type {
+                    "direct" => {
+                        info!("🌐 Trying Direct BrightData API for {} (method: {}, url: {}/{})", 
+                              source_name, method_sequence + 1, url_sequence + 1, urls_for_method.len());
+                        self.try_fetch_url_direct_api(
+                            url, query, market, source_name, query_priority, token_budget, 
+                            execution_id, url_sequence as u64, method_sequence as u64
+                        ).await
+                    }
+                    "proxy" => {
+                        info!("🔄 Trying Proxy method for {} (method: {}, url: {}/{})", 
+                              source_name, method_sequence + 1, url_sequence + 1, urls_for_method.len());
+                        self.try_fetch_url_via_proxy(
+                            url, query, market, source_name, query_priority, token_budget, 
+                            execution_id, url_sequence as u64, method_sequence as u64
+                        ).await
+                    }
+                    _ => continue,
+                };
 
-        // Build enhanced search query with priority awareness
-        let search_query = self.build_etf_query_with_priority(query, market, etf_type, data_points, query_priority);
-        
-        // Build enhanced query parameters with priority-based limits
-        let mut query_params = HashMap::new();
-        query_params.insert("q".to_string(), search_query.clone());
-        
-        // Pagination (adjusted based on priority)
-        if page > 1 {
-            let start = (page - 1) * num_results;
-            query_params.insert("start".to_string(), start.to_string());
+                match attempt_result {
+                    Ok(mut result) => {
+                        let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                        
+                        attempts.push(json!({
+                            "source": source_name,
+                            "url": url,
+                            "method": method_name,
+                            "status": "success",
+                            "content_length": content.len(),
+                            "method_sequence": method_sequence + 1,
+                            "url_sequence": url_sequence + 1
+                        }));
+                        
+                        // SUCCESS
+                        result["source_used"] = json!(source_name);
+                        result["url_used"] = json!(url);
+                        result["method_used"] = json!(method_name);
+                        result["execution_id"] = json!(execution_id);
+                        result["priority"] = json!(format!("{:?}", query_priority));
+                        result["token_budget"] = json!(token_budget);
+                        result["attempts"] = json!(attempts);
+                        result["successful_method_sequence"] = json!(method_sequence + 1);
+                        result["successful_url_sequence"] = json!(url_sequence + 1);
+                        
+                        info!("✅ Successfully fetched ETF data from {} via {} (method: {}, url: {})", 
+                              source_name, method_name, method_sequence + 1, url_sequence + 1);
+                        
+                        return Ok(result);
+                    }
+                    Err(e) => {
+                        attempts.push(json!({
+                            "source": source_name,
+                            "url": url,
+                            "method": method_name,
+                            "status": "failed",
+                            "error": e.to_string(),
+                            "method_sequence": method_sequence + 1,
+                            "url_sequence": url_sequence + 1
+                        }));
+                        
+                        last_error = Some(e);
+                        warn!("❌ Failed to fetch from {} via {} (method: {}, url: {}): {:?}", 
+                              source_name, method_name, method_sequence + 1, url_sequence + 1, last_error);
+                    }
+                }
+            }
         }
+
+        // All methods and sources failed - return empty data instead of error
+        warn!("❌ All sources and methods failed for query '{}'. Returning empty data for Anthropic retry", query);
         
-        // Adjust results based on priority and token budget
-        let effective_num_results = match query_priority {
-            crate::filters::strategy::QueryPriority::Critical => num_results,
-            crate::filters::strategy::QueryPriority::High => std::cmp::min(num_results, 15),
-            crate::filters::strategy::QueryPriority::Medium => std::cmp::min(num_results, 10),
-            crate::filters::strategy::QueryPriority::Low => std::cmp::min(num_results, 5),
-        };
-        query_params.insert("num".to_string(), effective_num_results.to_string());
+        let empty_result = json!({
+            "query": query,
+            "market": market,
+            "status": "no_data_found",
+            "attempts": attempts,
+            "execution_id": execution_id,
+            "total_attempts": method_urls.direct.len() + method_urls.proxy.len(),
+            "reason": "all_sources_failed"
+        });
         
-        // Localization based on market
-        let (country, language) = self.get_market_settings(market);
-        if !country.is_empty() {
-            query_params.insert("gl".to_string(), country.to_string());
-        }
-        query_params.insert("hl".to_string(), language.to_string());
+        Ok(empty_result)
+    }
+
+    // Direct BrightData API method (existing implementation)
+    async fn try_fetch_url_direct_api(
+        &self, 
+        url: &str, 
+        query: &str, 
+        market: &str, 
+        source_name: &str, 
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
+        execution_id: &str,
+        sequence: u64,
+        method_sequence: u64
+    ) -> Result<Value, BrightDataError> {
+        let max_retries = env::var("MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
         
-        // Time-based filtering (skip for low priority to save tokens)
-        if time_filter != "any" && !matches!(query_priority, crate::filters::strategy::QueryPriority::Low) {
-            let tbs_value = match time_filter {
-                "day" => "qdr:d",
-                "week" => "qdr:w",
-                "month" => "qdr:m",
-                "year" => "qdr:y",
-                _ => ""
+        let mut last_error = None;
+        
+        for retry_attempt in 0..max_retries {
+            let start_time = Instant::now();
+            let attempt_id = format!("{}_direct_s{}_m{}_r{}", execution_id, sequence, method_sequence, retry_attempt);
+            
+            info!("🌐 Direct API: Fetching from {} (execution: {}, retry: {}/{})", 
+                  source_name, attempt_id, retry_attempt + 1, max_retries);
+            
+            let api_token = env::var("BRIGHTDATA_API_TOKEN")
+                .or_else(|_| env::var("API_TOKEN"))
+                .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN environment variable".into()))?;
+
+            let base_url = env::var("BRIGHTDATA_BASE_URL")
+                .unwrap_or_else(|_| "https://api.brightdata.com".to_string());
+
+            let zone = env::var("WEB_UNLOCKER_ZONE")
+                .unwrap_or_else(|_| "mcp_unlocker".to_string());
+
+            let payload = json!({
+                "url": url,
+                "zone": zone,
+                "format": "raw",
+            });
+
+            let client = Client::builder()
+                .timeout(Duration::from_secs(90))
+                .build()
+                .map_err(|e| BrightDataError::ToolError(format!("Failed to create HTTP client: {}", e)))?;
+
+            let response = client
+                .post(&format!("{}/request", base_url))
+                .header("Authorization", format!("Bearer {}", api_token))
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| BrightDataError::ToolError(format!("Direct API request failed to {}: {}", source_name, e)))?;
+
+            let duration = start_time.elapsed();
+            let status = response.status().as_u16();
+            let response_headers: HashMap<String, String> = response
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+
+            let response_text = response.text().await
+                .map_err(|e| BrightDataError::ToolError(format!("Failed to read response body from {}: {}", source_name, e)))?;
+
+            // Handle server errors with retry
+            if matches!(status, 502 | 503 | 504) && retry_attempt < max_retries - 1 {
+                let wait_time = Duration::from_millis(1000 + (retry_attempt as u64 * 1000));
+                warn!("⏳ Direct API: Server error {}, waiting {}ms before retry...", status, wait_time.as_millis());
+                tokio::time::sleep(wait_time).await;
+                last_error = Some(BrightDataError::ToolError(format!("Direct API server error: {}", status)));
+                continue;
+            }
+            
+            if !(200..300).contains(&status) {
+                let error_msg = format!("Direct API: {} returned HTTP {}: {}", source_name, status, 
+                                      &response_text[..response_text.len().min(500)]);
+                last_error = Some(BrightDataError::ToolError(error_msg));
+                if retry_attempt == max_retries - 1 {
+                    return Err(last_error.unwrap());
+                }
+                continue;
+            }
+
+            // SUCCESS - Process response (apply filtering only if DEDUCT_DATA=true)
+            let raw_content = response_text;
+            let filtered_content = if self.is_data_reduction_enabled() {
+                // TODO: Add content filtering logic when DEDUCT_DATA=true
+                raw_content.clone()
+            } else {
+                raw_content.clone()
             };
-            if !tbs_value.is_empty() {
-                query_params.insert("tbs".to_string(), tbs_value.to_string());
+
+            // Log metrics
+            if let Err(e) = BRIGHTDATA_METRICS.log_call(
+                &attempt_id,
+                url,
+                &zone,
+                "raw",
+                None,
+                payload.clone(),
+                status,
+                response_headers.clone(),
+                &raw_content,
+                Some(&filtered_content),
+                duration.as_millis() as u64,
+                None,
+                None,
+            ).await {
+                warn!("Failed to log direct API metrics: {}", e);
             }
+
+            return Ok(json!({
+                "content": filtered_content,
+                "raw_content": raw_content,
+                "query": query,
+                "market": market,
+                "source": source_name,
+                "method": "Direct BrightData API",
+                "priority": format!("{:?}", priority),
+                "token_budget": token_budget,
+                "execution_id": execution_id,
+                "sequence": sequence,
+                "method_sequence": method_sequence,
+                "success": true,
+                "url": url,
+                "zone": zone,
+                "format": "raw",
+                "status_code": status,
+                "response_size_bytes": raw_content.len(),
+                "filtered_size_bytes": filtered_content.len(),
+                "duration_ms": duration.as_millis(),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "retry_attempts": retry_attempt + 1,
+                "max_retries": max_retries,
+                "payload_used": payload
+            }));
         }
 
-        // Build URL with query parameters
-        let mut search_url = "https://www.google.com/search".to_string();
-        let query_string = query_params.iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
+        Err(last_error.unwrap_or_else(|| BrightDataError::ToolError("Direct API: All retry attempts failed".into())))
+    }
+
+    // Proxy-based method
+    async fn try_fetch_url_via_proxy(
+        &self, 
+        url: &str, 
+        query: &str, 
+        market: &str, 
+        source_name: &str, 
+        priority: crate::filters::strategy::QueryPriority,
+        token_budget: usize,
+        execution_id: &str,
+        sequence: u64,
+        method_sequence: u64
+    ) -> Result<Value, BrightDataError> {
+        let max_retries = env::var("MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
         
-        if !query_string.is_empty() {
-            search_url = format!("{}?{}", search_url, query_string);
-        }
+        let mut last_error = None;
+        
+        // Get proxy configuration from environment
+        let proxy_host = env::var("BRIGHTDATA_PROXY_HOST")
+            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_PROXY_HOST environment variable".into()))?;
+        let proxy_port = env::var("BRIGHTDATA_PROXY_PORT")
+            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_PROXY_PORT environment variable".into()))?;
+        let proxy_username = env::var("BRIGHTDATA_PROXY_USERNAME")
+            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_PROXY_USERNAME environment variable".into()))?;
+        let proxy_password = env::var("BRIGHTDATA_PROXY_PASSWORD")
+            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_PROXY_PASSWORD environment variable".into()))?;
 
-        let mut payload = json!({
-            "url": search_url,
-            "zone": zone,
-            "format": "raw",
-            "render": true,
-            "data_format": "markdown"
-        });
-
-        // Add priority processing hints
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
+        let proxy_url = format!("http://{}:{}@{}:{}", proxy_username, proxy_password, proxy_host, proxy_port);
+        
+        for retry_attempt in 0..max_retries {
+            let start_time = Instant::now();
+            let attempt_id = format!("{}_proxy_s{}_m{}_r{}", execution_id, sequence, method_sequence, retry_attempt);
             
-            payload["processing_priority"] = json!(format!("{:?}", query_priority));
-            payload["token_budget"] = json!(token_budget);
-            payload["focus_data_points"] = json!(data_points);
-            payload["etf_focus"] = json!(etf_type);
+            info!("🔄 Proxy: Fetching from {} via proxy (execution: {}, retry: {}/{})", 
+                  source_name, attempt_id, retry_attempt + 1, max_retries);
+            
+            // Create client with proxy configuration
+            let proxy = reqwest::Proxy::all(&proxy_url)
+                .map_err(|e| BrightDataError::ToolError(format!("Failed to create proxy: {}", e)))?;
+
+            let client = Client::builder()
+                .proxy(proxy)
+                .timeout(Duration::from_secs(90))
+                .danger_accept_invalid_certs(true) // Often needed for proxy connections
+                .build()
+                .map_err(|e| BrightDataError::ToolError(format!("Failed to create proxy client: {}", e)))?;
+
+            let response = client
+                .get(url)
+                .header("x-unblock-data-format", "markdown")
+                .send()
+                .await
+                .map_err(|e| BrightDataError::ToolError(format!("Proxy request failed to {}: {}", source_name, e)))?;
+
+            let duration = start_time.elapsed();
+            let status = response.status().as_u16();
+            let response_headers: HashMap<String, String> = response
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                .collect();
+
+            let response_text = response.text().await
+                .map_err(|e| BrightDataError::ToolError(format!("Failed to read proxy response body from {}: {}", source_name, e)))?;
+
+            // Handle server errors with retry
+            if matches!(status, 502 | 503 | 504) && retry_attempt < max_retries - 1 {
+                let wait_time = Duration::from_millis(1000 + (retry_attempt as u64 * 1000));
+                warn!("Proxy: Server error {}, waiting {}ms before retry...", status, wait_time.as_millis());
+                tokio::time::sleep(wait_time).await;
+                last_error = Some(BrightDataError::ToolError(format!("Proxy server error: {}", status)));
+                continue;
+            }
+            
+            if !(200..300).contains(&status) {
+                let error_msg = format!("Proxy: {} returned HTTP {}: {}", source_name, status, 
+                                      &response_text[..response_text.len().min(200)]);
+                
+                warn!("Proxy HTTP error: {}", error_msg);
+                last_error = Some(BrightDataError::ToolError(error_msg));
+                
+                // Log error metrics for proxy
+                let proxy_payload = json!({
+                    "url": url,
+                    "method": "proxy",
+                    "proxy_host": proxy_host,
+                    "proxy_port": proxy_port,
+                    "error": format!("HTTP {}", status)
+                });
+
+                if let Err(e) = BRIGHTDATA_METRICS.log_call(
+                    &attempt_id,
+                    url,
+                    "proxy",
+                    "raw",
+                    None,
+                    proxy_payload,
+                    status,
+                    response_headers.clone(),
+                    &response_text,
+                    Some(&format!("Proxy HTTP {} Error", status)),
+                    duration.as_millis() as u64,
+                    None,
+                    None,
+                ).await {
+                    warn!("Failed to log proxy error metrics: {}", e);
+                }
+                
+                if retry_attempt == max_retries - 1 {
+                    return Err(last_error.unwrap());
+                }
+                continue;
+            }
+
+            // SUCCESS - Process response (apply filtering only if DEDUCT_DATA=true)
+            let raw_content = response_text;
+            let filtered_content = if self.is_data_reduction_enabled() {
+                // TODO: Add content filtering logic when DEDUCT_DATA=true
+                raw_content.clone()
+            } else {
+                raw_content.clone()
+            };
+
+            // Log metrics (using a simplified payload for proxy requests)
+            let proxy_payload = json!({
+                "url": url,
+                "method": "proxy",
+                "proxy_host": proxy_host,
+                "proxy_port": proxy_port
+            });
+
+            if let Err(e) = BRIGHTDATA_METRICS.log_call(
+                &attempt_id,
+                url,
+                "proxy",
+                "raw",
+                None,
+                proxy_payload.clone(),
+                status,
+                response_headers.clone(),
+                &raw_content,
+                Some(&filtered_content),
+                duration.as_millis() as u64,
+                None,
+                None,
+            ).await {
+                warn!("Failed to log proxy metrics: {}", e);
+            }
+
+            return Ok(json!({
+                "content": filtered_content,
+                "raw_content": raw_content,
+                "query": query,
+                "market": market,
+                "source": source_name,
+                "method": "BrightData Proxy",
+                "priority": format!("{:?}", priority),
+                "token_budget": token_budget,
+                "execution_id": execution_id,
+                "sequence": sequence,
+                "method_sequence": method_sequence,
+                "success": true,
+                "url": url,
+                "proxy_host": proxy_host,
+                "proxy_port": proxy_port,
+                "status_code": status,
+                "response_size_bytes": raw_content.len(),
+                "filtered_size_bytes": filtered_content.len(),
+                "duration_ms": duration.as_millis(),
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "retry_attempts": retry_attempt + 1,
+                "max_retries": max_retries,
+                "payload_used": proxy_payload
+            }));
         }
 
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
+        Err(last_error.unwrap_or_else(|| BrightDataError::ToolError("Proxy: All retry attempts failed".into())))
+    }
 
-        let response = client
-            .post(&format!("{}/request", base_url))
-            .header("Authorization", format!("Bearer {}", api_token))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| BrightDataError::ToolError(format!("Enhanced ETF request failed: {}", e)))?;
+    fn is_likely_etf_symbol(&self, query: &str) -> bool {
+        let clean = query.trim();
+        
+        if clean.len() < 1 || clean.len() > 15 {
+            return false;
+        }
 
-        let status = response.status().as_u16();
-        let response_headers: HashMap<String, String> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
+        let valid_chars = clean.chars().all(|c| c.is_alphanumeric() || c == '.');
+        let has_letters = clean.chars().any(|c| c.is_alphabetic());
+        
+        valid_chars && has_letters
+    }
 
-        // Log BrightData request
-        if let Err(e) = JSON_LOGGER.log_brightdata_request(
-            execution_id,
-            &zone,
-            &format!("Enhanced ETF: {} ({})", search_query, market),
-            payload.clone(),
-            status,
-            response_headers,
-            "markdown"
+    /// Test both direct API and proxy connectivity
+    pub async fn test_connectivity(&self) -> Result<String, BrightDataError> {
+        let test_url = "https://finance.yahoo.com/quote/BTC-USD/";
+        let mut results = Vec::new();
+        
+        // Test Direct API
+        info!("Testing Direct BrightData API...");
+        match self.try_fetch_url_direct_api(
+            test_url, "BTC", "usd", "Yahoo Finance Test", 
+            crate::filters::strategy::QueryPriority::High, 1000, 
+            "connectivity_test", 0, 0
         ).await {
-            log::warn!("Failed to log BrightData request: {}", e);
-        }
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(BrightDataError::ToolError(format!(
-                "BrightData enhanced ETF error {}: {}",
-                status, error_text
-            )));
-        }
-
-        let raw_content = response.text().await
-            .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
-
-        // Apply filters conditionally based on environment variable with priority awareness
-        let filtered_content = if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            if ResponseFilter::is_error_page(&raw_content) {
-                return Err(BrightDataError::ToolError("Enhanced ETF search returned error page".into()));
-            } else if ResponseStrategy::should_try_next_source(&raw_content) {
-                return Err(BrightDataError::ToolError("Content quality too low".into()));
-            } else {
-                // Use enhanced extraction with token budget awareness
-                let max_tokens = token_budget / 3; // Reserve tokens for formatting
-                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
+            Ok(_) => {
+                results.push("Direct API: SUCCESS".to_string());
             }
-        } else {
-            raw_content.clone()
-        };
-
-        // Format the results with priority awareness
-        let formatted_content = self.format_etf_results_with_priority(&filtered_content, query, market, etf_type, data_points, page, effective_num_results, query_priority);
-
-        Ok(json!({
-            "content": filtered_content,
-            "formatted_content": formatted_content,
-            "query": query,
-            "search_query": search_query,
-            "market": market,
-            "etf_type": etf_type,
-            "data_points": data_points,
-            "priority": format!("{:?}", query_priority),
-            "token_budget": token_budget,
-            "page": page,
-            "num_results": effective_num_results,
-            "time_filter": time_filter,
-            "zone": zone,
-            "execution_id": execution_id,
-            "raw_response": raw_content,
-            "success": true,
-            "api_type": "enhanced_priority_serp"
-        }))
-    }
-
-    async fn fetch_etf_data_legacy_with_priority(&self, query: &str, market: &str, priority: crate::filters::strategy::QueryPriority, token_budget: usize, execution_id: &str) -> Result<Value, BrightDataError> {
-        let api_token = env::var("BRIGHTDATA_API_TOKEN")
-            .or_else(|_| env::var("API_TOKEN"))
-            .map_err(|_| BrightDataError::ToolError("Missing BRIGHTDATA_API_TOKEN".into()))?;
-
-        let base_url = env::var("BRIGHTDATA_BASE_URL")
-            .unwrap_or_else(|_| "https://api.brightdata.com".to_string());
-
-        let zone = env::var("WEB_UNLOCKER_ZONE")
-            .unwrap_or_else(|_| "default".to_string());
-
-        let search_url = match market {
-            "indian" => format!("https://www.google.com/search?q={} ETF NAV performance india NSE BSE", urlencoding::encode(query)),
-            "us" => format!("https://www.google.com/search?q={} ETF price performance expense ratio holdings", urlencoding::encode(query)),
-            "global" => format!("https://www.google.com/search?q={} ETF global performance holdings", urlencoding::encode(query)),
-            _ => format!("https://www.google.com/search?q={} ETF performance NAV", urlencoding::encode(query))
-        };
-
-        let mut payload = json!({
-            "url": search_url,
-            "zone": zone,
-            "format": "raw",
-            "data_format": "markdown"
-        });
-
-        // Add priority processing hints
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            payload["processing_priority"] = json!(format!("{:?}", priority));
-            payload["token_budget"] = json!(token_budget);
+            Err(e) => {
+                results.push(format!("Direct API: FAILED - {}", e));
+            }
         }
-
-        let client = Client::builder()
-            .timeout(Duration::from_secs(120))
-            .build()
-            .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
-
-        let response = client
-            .post(&format!("{}/request", base_url))
-            .header("Authorization", format!("Bearer {}", api_token))
-            .header("Content-Type", "application/json")
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| BrightDataError::ToolError(format!("ETF data request failed: {}", e)))?;
-
-        let status = response.status().as_u16();
-        let response_headers: HashMap<String, String> = response
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-
-        // Log BrightData request
-        if let Err(e) = JSON_LOGGER.log_brightdata_request(
-            execution_id,
-            &zone,
-            &search_url,
-            payload.clone(),
-            status,
-            response_headers,
-            "markdown"
+        
+        // Test Proxy
+        info!("Testing Proxy method...");
+        match self.try_fetch_url_via_proxy(
+            test_url, "BTC", "usd", "Yahoo Finance Test", 
+            crate::filters::strategy::QueryPriority::High, 1000, 
+            "connectivity_test", 0, 1
         ).await {
-            log::warn!("Failed to log BrightData request: {}", e);
-        }
-
-        if !response.status().is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(BrightDataError::ToolError(format!(
-                "BrightData ETF data error {}: {}",
-                status, error_text
-            )));
-        }
-
-        let raw_content = response.text().await
-            .map_err(|e| BrightDataError::ToolError(e.to_string()))?;
-
-        // Apply filters conditionally with priority awareness
-        let filtered_content = if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            if ResponseFilter::is_error_page(&raw_content) {
-                return Err(BrightDataError::ToolError("ETF search returned error page".into()));
-            } else {
-                let max_tokens = token_budget / 2;
-                ResponseFilter::extract_high_value_financial_data(&raw_content, max_tokens)
+            Ok(_) => {
+                results.push("Proxy: SUCCESS".to_string());
             }
-        } else {
-            raw_content.clone()
-        };
-
-        Ok(json!({
-            "content": filtered_content,
-            "query": query,
-            "market": market,
-            "priority": format!("{:?}", priority),
-            "token_budget": token_budget,
-            "execution_id": execution_id,
-            "success": true,
-            "api_type": "legacy_priority"
-        }))
-    }
-
-    // ENHANCED: Priority-aware ETF query building
-    fn build_etf_query_with_priority(&self, query: &str, market: &str, etf_type: &str, data_points: &[&str], priority: crate::filters::strategy::QueryPriority) -> String {
-        let mut search_terms = vec![query.to_string()];
-        
-        // Add ETF identifier
-        search_terms.push("ETF".to_string());
-        
-        // Priority-based term selection
-        match priority {
-            crate::filters::strategy::QueryPriority::Critical => {
-                // Focus on current, real-time data for critical queries
-                search_terms.extend_from_slice(&["current".to_string(), "live".to_string(), "price".to_string()]);
-                for data_point in data_points.iter().take(2) { // Limit data points for focus
-                    match *data_point {
-                        "price" => search_terms.push("price".to_string()),
-                        "nav" => search_terms.push("NAV".to_string()),
-                        _ => {}
-                    }
-                }
-            }
-            crate::filters::strategy::QueryPriority::High => {
-                // Include key ETF data points
-                for data_point in data_points.iter().take(3) {
-                    match *data_point {
-                        "price" => search_terms.push("price".to_string()),
-                        "nav" => search_terms.push("NAV".to_string()),
-                        "performance" => search_terms.push("performance".to_string()),
-                        "expense_ratio" => search_terms.push("expense ratio".to_string()),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {
-                // General terms for lower priority
-                search_terms.push("overview".to_string());
+            Err(e) => {
+                results.push(format!("Proxy: FAILED - {}", e));
             }
         }
         
-        // Add ETF type if specified and priority allows
-        if etf_type != "any" && !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
-            search_terms.push(format!("{} ETF", etf_type));
-        }
-        
-        // Add market-specific terms (only for higher priority)
-        if !matches!(priority, crate::filters::strategy::QueryPriority::Low) {
-            match market {
-                "indian" => {
-                    search_terms.extend_from_slice(&[
-                        "india".to_string(),
-                        "NSE".to_string(),
-                        "BSE".to_string()
-                    ]);
-                }
-                "us" => {
-                    search_terms.push("US".to_string());
-                }
-                "global" => {
-                    search_terms.push("global".to_string());
-                }
-                _ => {}
-            }
-        }
-        
-        search_terms.join(" ")
-    }
-
-    fn get_market_settings(&self, market: &str) -> (&str, &str) {
-        match market {
-            "indian" => ("in", "en"),
-            "us" => ("us", "en"),
-            "global" => ("", "en"),
-            _ => ("us", "en")
-        }
-    }
-
-    // ENHANCED: Priority-aware result formatting
-    fn format_etf_results_with_priority(&self, content: &str, query: &str, market: &str, etf_type: &str, data_points: &[&str], page: u32, num_results: u32, _priority: crate::filters::strategy::QueryPriority) -> String {
-        // Check if we need compact formatting
-        if std::env::var("TRUNCATE_FILTER")
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false) {
-            
-            // Ultra-compact formatting for filtered mode
-            return format!("📊 {}: {}", 
-                ResponseStrategy::ultra_abbreviate_query(query), 
-                content
-            );
-        }
-
-        // Regular formatting for non-filtered mode
-        self.format_etf_results(content, query, market, etf_type, data_points, page, num_results)
-    }
-
-    fn format_etf_results(&self, content: &str, query: &str, market: &str, etf_type: &str, data_points: &[&str], page: u32, num_results: u32) -> String {
-        let mut formatted = String::new();
-        
-        // Add header with search parameters
-        formatted.push_str(&format!("# ETF Data: {}\n\n", query));
-        formatted.push_str(&format!("**Market**: {} | **ETF Type**: {} | **Data Points**: {:?}\n", 
-            market.to_uppercase(), etf_type, data_points));
-        formatted.push_str(&format!("**Page**: {} | **Results**: {}\n\n", page, num_results));
-        
-        // Try to parse JSON response if available
-        if let Ok(json_data) = serde_json::from_str::<Value>(content) {
-            // If we get structured JSON, format it nicely
-            if let Some(results) = json_data.get("organic_results").and_then(|r| r.as_array()) {
-                formatted.push_str("## ETF Information\n\n");
-                for (i, result) in results.iter().take(num_results as usize).enumerate() {
-                    let title = result.get("title").and_then(|t| t.as_str()).unwrap_or("No title");
-                    let link = result.get("link").and_then(|l| l.as_str()).unwrap_or("");
-                    let snippet = result.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
-                    
-                    formatted.push_str(&format!("### {}. {}\n", i + 1, title));
-                    if !link.is_empty() {
-                        formatted.push_str(&format!("**Source**: {}\n", link));
-                    }
-                    if !snippet.is_empty() {
-                        formatted.push_str(&format!("**Details**: {}\n", snippet));
-                    }
-                    
-                    // Highlight specific data points if found in snippet
-                    self.highlight_data_points(&mut formatted, snippet, data_points);
-                    formatted.push_str("\n");
-                }
-            } else {
-                // JSON but no organic_results, return formatted JSON
-                formatted.push_str("## ETF Data\n\n");
-                formatted.push_str("```json\n");
-                formatted.push_str(&serde_json::to_string_pretty(&json_data).unwrap_or_else(|_| content.to_string()));
-                formatted.push_str("\n```\n");
-            }
-        } else {
-            // Plain text/markdown response
-            formatted.push_str("## ETF Information\n\n");
-            formatted.push_str(content);
-        }
-        
-        // Add pagination info
-        if page > 1 || num_results < 100 {
-            formatted.push_str(&format!("\n---\n*Page {} of ETF results*\n", page));
-            if page > 1 {
-                formatted.push_str("💡 *To get more results, use page parameter*\n");
-            }
-        }
-        
-        formatted
-    }
-
-    fn highlight_data_points(&self, formatted: &mut String, snippet: &str, data_points: &[&str]) {
-        let snippet_lower = snippet.to_lowercase();
-        let mut found_points = Vec::new();
-        
-        for data_point in data_points {
-            match *data_point {
-                "price" if snippet_lower.contains("price") || snippet_lower.contains("$") || snippet_lower.contains("₹") => {
-                    found_points.push("💰 Price data detected");
-                }
-                "nav" if snippet_lower.contains("nav") => {
-                    found_points.push("📊 NAV information available");
-                }
-                "holdings" if snippet_lower.contains("hold") => {
-                    found_points.push("🏦 Holdings data found");
-                }
-                "performance" if snippet_lower.contains("return") || snippet_lower.contains("performance") => {
-                    found_points.push("📈 Performance metrics available");
-                }
-                "expense_ratio" if snippet_lower.contains("expense") || snippet_lower.contains("fee") => {
-                    found_points.push("💸 Expense ratio information");
-                }
-                "volume" if snippet_lower.contains("volume") => {
-                    found_points.push("📊 Volume data available");
-                }
-                "dividend" if snippet_lower.contains("dividend") || snippet_lower.contains("yield") => {
-                    found_points.push("💵 Dividend information found");
-                }
-                _ => {}
-            }
-        }
-        
-        if !found_points.is_empty() {
-            formatted.push_str("**Key Data Points**: ");
-            formatted.push_str(&found_points.join(" | "));
-            formatted.push_str("\n");
-        }
+        Ok(format!("Connectivity Test Results:\n{}", results.join("\n")))
     }
 }
+
+

@@ -483,21 +483,15 @@ impl ToolResolver {
         match name {
             // Core tools
             // "search_web" => Some(Box::new(crate::tools::search::SearchEngine)),
-            "extract_data" => Some(Box::new(crate::tools::extract::Extractor)),
             "scrape_website" => Some(Box::new(crate::tools::scrape::Scraper)),
-            // "take_screenshot" => Some(Box::new(crate::tools::screenshot::ScreenshotTool)),
-            
-            // Financial tools - using individual modules
+            "get_forex_data" => Some(Box::new(crate::tools::forex::ForexDataTool)),
             "get_stock_data" => Some(Box::new(crate::tools::stock::StockDataTool)),
             "get_crypto_data" => Some(Box::new(crate::tools::crypto::CryptoDataTool)),
             "get_etf_data" => Some(Box::new(crate::tools::etf::ETFDataTool)),
             "get_bond_data" => Some(Box::new(crate::tools::bond::BondDataTool)),
-            "get_mutual_fund_data" => Some(Box::new(crate::tools::mutual_fund::MutualFundDataTool)),
+            "get_indices_data" => Some(Box::new(crate::tools::index::IndexDataTool)),
             "get_commodity_data" => Some(Box::new(crate::tools::commodity::CommodityDataTool)),
-            
-            // Additional tools if needed
-            "multi_zone_search" => Some(Box::new(crate::tools::multi_zone_search::MultiZoneSearch)),
-            
+            "get_mutual_fund_data" => Some(Box::new(crate::tools::mutual_fund::MutualFundDataTool)),
             _ => None,
         }
     }
@@ -508,32 +502,6 @@ impl ToolResolver {
 
     pub fn list_tools(&self) -> Vec<Value> {
         vec![
-            // Core tools
-            // serde_json::json!({
-            //     "name": "search_web",
-            //     "description": "Search the web using various search engines via BrightData",
-            //     "inputSchema": {
-            //         "type": "object",
-            //         "properties": {
-            //             "query": {
-            //                 "type": "string",
-            //                 "description": "Search query"
-            //             },
-            //             "engine": {
-            //                 "type": "string",
-            //                 "enum": ["google", "bing", "yandex", "duckduckgo"],
-            //                 "description": "Search engine to use",
-            //                 "default": "google"
-            //             },
-            //             "cursor": {
-            //                 "type": "string",
-            //                 "description": "Pagination cursor/page number",
-            //                 "default": "0"
-            //             }
-            //         },
-            //         "required": ["query"]
-            //     }
-            // }),
             serde_json::json!({
                 "name": "scrape_website",
                 "description": "Scrap structured data from a webpage using AI analysis",
@@ -557,64 +525,8 @@ impl ToolResolver {
                     "required": ["url", "user_id"]
                 }
             }),
-            serde_json::json!({
-                "name": "extract_data",
-                "description": "Extract structured data from a webpage using AI analysis",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "The URL to extract data from"
-                        },
-                        "schema": {
-                            "type": "object",
-                            "description": "Optional schema to guide extraction",
-                            "additionalProperties": true
-                        },
-                        "user_id": {
-                            "type": "string", 
-                            "description": "Session ID for caching and conversation context tracking"
-                        }
-                    },
-                    "required": ["url", "user_id"]
-                }
-            }),
-            // serde_json::json!({
-            //     "name": "take_screenshot",
-            //     "description": "Take a screenshot of a webpage using BrightData Browser",
-            //     "inputSchema": {
-            //         "type": "object",
-            //         "properties": {
-            //             "url": {
-            //                 "type": "string",
-            //                 "description": "The URL to screenshot"
-            //             },
-            //             "width": {
-            //                 "type": "integer",
-            //                 "description": "Screenshot width",
-            //                 "default": 1280,
-            //                 "minimum": 320,
-            //                 "maximum": 1920
-            //             },
-            //             "height": {
-            //                 "type": "integer",
-            //                 "description": "Screenshot height",
-            //                 "default": 720,
-            //                 "minimum": 240,
-            //                 "maximum": 1080
-            //             },
-            //             "full_page": {
-            //                 "type": "boolean",
-            //                 "description": "Capture full page height",
-            //                 "default": false
-            //             }
-            //         },
-            //         "required": ["url"]
-            //     }
-            // }),
 
-            // Financial tools
+            // Stock tools
             serde_json::json!({
                 "name": "get_stock_data",
                 "description": "Get comprehensive stock data including prices, performance, market cap, volumes for specific stock symbols",
@@ -639,112 +551,146 @@ impl ToolResolver {
                     "required": ["symbol", "user_id"]
                 }
             }),
+
+            // Crypto tools
             serde_json::json!({
                 "name": "get_crypto_data",
                 "description": "Get cryptocurrency data including prices, market cap, trading volumes. Use for individual cryptos, crypto comparisons (BTC vs ETH), or overall crypto market analysis",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { 
-                            "type": "string", 
+                        "symbol": { 
+                            "symbol": "string", 
                             "description": "Crypto symbol (BTC, ETH, ADA), crypto name (Bitcoin, Ethereum), comparison query (BTC vs ETH), or market overview (crypto market today, top cryptocurrencies)" 
                         }
                     },
-                    "required": ["query"]
+                    "user_id": {
+                        "type": "string", 
+                        "description": "Session ID for caching and conversation context tracking"
+                    },
+                    "required": ["symbol", "user_id"]
                 }
             }),
+
+            // ETF tools
             serde_json::json!({
                 "name": "get_etf_data",
-                "description": "Get ETF and index fund data including NAV, holdings, performance, expense ratios",
+                "description": "Get comprehensive ETF snapshot (price, summary, metrics) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}.NS/ (e.g., NIFTYBEES).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { 
-                            "type": "string", 
-                            "description": "ETF symbol (SPY, NIFTYBEES), ETF name, or ETF market analysis query" 
-                        },
-                        "market": { 
-                            "type": "string", 
-                            "enum": ["indian", "us", "global"], 
-                            "default": "indian"
+                        "symbol": { 
+                            "symbol": "string", 
+                            "description": "ETF ticker or name (e.g., NIFTYBEES, JUNIORBEES). If provided, used when 'symbol' missing."
                         }
                     },
-                    "required": ["query"]
+                    "user_id": {
+                        "type": "string", 
+                        "description": "Session ID for caching and conversation context tracking"
+                    },
+                    "required": ["symbol", "user_id"]
                 }
             }),
+
+            // forex tools
             serde_json::json!({
-                "name": "get_bond_data",
-                "description": "Get bond market data including yields, government bonds, corporate bonds, and bond market trends",
+                "name": "get_forex_data",
+                "description": "Get comprehensive Forex snapshot (spot rate, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}=X/ (e.g., USDINR=X).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { 
-                            "type": "string", 
-                            "description": "Bond type (government bonds, corporate bonds), yield query (10-year yield), or bond market analysis" 
-                        },
-                        "market": { 
-                            "type": "string", 
-                            "enum": ["indian", "us", "global"], 
-                            "default": "indian"
+                        "symbol": { 
+                            "symbol": "string", 
+                            "description": "Forex pair (e.g., USDINR, EURUSD, USD/JPY). Used if 'symbol' missing."
                         }
                     },
-                    "required": ["query"]
-                }
-            }),
-            serde_json::json!({
-                "name": "get_mutual_fund_data",
-                "description": "Get mutual fund data including NAV, performance, portfolio composition, and fund comparisons",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": { 
-                            "type": "string", 
-                            "description": "Fund name, fund symbol, fund category (equity funds, debt funds), or fund comparison query" 
-                        },
-                        "market": { 
-                            "type": "string", 
-                            "enum": ["indian", "us", "global"], 
-                            "default": "indian"
-                        }
+                    "user_id": {
+                        "type": "string", 
+                        "description": "Session ID for caching and conversation context tracking"
                     },
-                    "required": ["query"]
+                    "required": ["symbol", "user_id"]
                 }
             }),
+
+            // Commodity tools
             serde_json::json!({
                 "name": "get_commodity_data",
-                "description": "Get commodity prices and market data including gold, silver, oil, agricultural commodities",
+                "description": "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}.MCX/ (e.g., CRUDEOIL.MCX, CRUDEOILM.MCX).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "query": { 
-                            "type": "string", 
-                            "description": "Commodity name (gold, silver, crude oil), commodity symbol, or commodity market overview" 
+                        "symbol": { 
+                            "symbol": "string", 
+                            "description": "Commodity/futures symbol (e.g., CRUDEOIL, CRUDEOIL, NATURALGAS). Used if 'symbol' missing."
                         }
                     },
-                    "required": ["query"]
+                    "user_id": {
+                        "type": "string", 
+                        "description": "Session ID for caching and conversation context tracking"
+                    },
+                    "required": ["symbol", "user_id"]
+                }
+            }),
+
+            // Bond tools
+            serde_json::json!({
+                "name": "get_bond_data",
+                "description": "Get bond/fund snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/^{SYMBOL}/ (e.g., ^TNX, ^IRX).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { 
+                            "symbol": "string", 
+                            "description": "Bond symbol (e.g., ^TNX, ^IRX, ^TYX, ^FVX). Used if 'symbol' missing.",
+                        }
+                    },
+                    "user_id": {
+                        "type": "string", 
+                        "description": "Session ID for caching and conversation context tracking"
+                    },
+                    "required": ["symbol", "user_id"]
+                }
+            }),
+
+            // Indices tools
+            serde_json::json!({
+                "name": "get_indices_data",
+                "description": "Get stock index snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/^{INDEX_CODE}/ (e.g., ^NSEI).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { 
+                            "symbol": "string", 
+                            "description":"Index code (e.g., ^NSEI, ^NSEBANK). Used if 'symbol' missing.",
+                        }
+                    },
+                    "user_id": {
+                        "type": "string", 
+                        "description": "Session ID for caching and conversation context tracking"
+                    },
+                    "required": ["symbol", "user_id"]
+                }
+            }),
+
+            // Mutual Fund tools
+            serde_json::json!({
+                "name": "get_mutual_fund_data",
+                "description": "Get mutual fund snapshot (price/NAV, summary) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{ISIN}.BO/ (e.g., INF846K01122.BO).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": { 
+                            "symbol": "string", 
+                            "description": "Indian mutual fund ISIN or display code (e.g., INF846K01122.BO). Used if 'symbol' missing.",
+                        }
+                    },
+                    "user_id": {
+                        "type": "string", 
+                        "description": "Session ID for caching and conversation context tracking"
+                    },
+                    "required": ["symbol", "user_id"]
                 }
             })
-            // serde_json::json!({
-            //     "name": "multi_zone_search",
-            //     "description": "Performs the same search query across multiple BrightData zones in parallel",
-            //     "inputSchema": {
-            //         "type": "object",
-            //         "properties": {
-            //             "query": { "type": "string" },
-            //             "engine": {
-            //                 "type": "string",
-            //                 "enum": ["google", "bing", "yandex", "duckduckgo"],
-            //                 "default": "google"
-            //             },
-            //             "zones": {
-            //                 "type": "array",
-            //                 "items": { "type": "string" },
-            //                 "description": "List of BrightData zone names to run parallel searches"
-            //             }
-            //         },
-            //         "required": ["query", "zones"]
-            //     }
-            // })
         ]
     }
 
@@ -752,16 +698,15 @@ impl ToolResolver {
     pub fn get_available_tool_names(&self) -> Vec<&'static str> {
         vec![
             // "search_web", 
-            "extract_data",
             "scrape_website",
-            // "take_screenshot",
+            "get_forex_data",
             "get_stock_data",
             "get_crypto_data",
             "get_etf_data",
+            "get_commodity_data",
+            "get_indices_data",
             "get_bond_data",
             "get_mutual_fund_data",
-            "get_commodity_data",
-            // "multi_zone_search"
         ]
     }
 

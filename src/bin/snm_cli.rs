@@ -1,5 +1,5 @@
 // src/bin/snm_cli.rs - Cleaned up version
-use snm_brightdata_client::tools::{search::SearchEngine, extract::Extractor, screenshot::ScreenshotTool};
+use snm_brightdata_client::tools::{search::SearchEngine};
 use snm_brightdata_client::tool::{Tool, ToolResult};
 use snm_brightdata_client::error::BrightDataError;
 use clap::{Parser, Subcommand};
@@ -22,22 +22,6 @@ enum Commands {
         #[arg(short, long, default_value = "google")]
         engine: String,
     },
-    /// Extract structured data from a webpage
-    Extract { 
-        url: String,
-        #[arg(short, long, default_value = "json")]
-        format: String,
-    },
-    /// Take a screenshot of a webpage
-    Screenshot {
-        url: String,
-        #[arg(short, long, default_value_t = 1280)]
-        width: i32,
-        #[arg(short, long, default_value_t = 720)]
-        height: i32,
-        #[arg(long)]
-        full_page: bool,
-    },
 }
 
 #[tokio::main]
@@ -51,23 +35,6 @@ async fn main() {
         Commands::Search { query, engine } => {
             let result = SearchEngine
                 .execute(json!({"query": query, "engine": engine}))
-                .await;
-            handle_result(result);
-        },
-        Commands::Extract { url, format } => {
-            let result = Extractor
-                .execute(json!({"url": url, "format": format}))
-                .await;
-            handle_result(result);
-        },
-        Commands::Screenshot { url, width, height, full_page } => {
-            let result = ScreenshotTool
-                .execute(json!({
-                    "url": url,
-                    "width": width,
-                    "height": height,
-                    "full_page": full_page
-                }))
                 .await;
             handle_result(result);
         },
