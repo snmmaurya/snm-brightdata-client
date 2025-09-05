@@ -1,6 +1,6 @@
 [package]
 name = "snm-brightdata-client"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2021"
 description = "Bright Data Wrapper Client Highly compacted Data implemented in Rust with Actix Web"
 authors = ["Snm Maurya <sxmmaurya@gmail.com.com>"]
