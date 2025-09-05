@@ -30,7 +30,7 @@ impl Tool for CommodityDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://in.tradingview.com/symbols/MCX-{}!/ (e.g., MCX.NATURALGAS1, MCX.CRUDEOIL1)."
+        "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://in.tradingview.com/symbols/MCX-{}!/ (e.g., MCX-NATURALGAS1, MCX-CRUDEOIL1)."
     }
 
     fn input_schema(&self) -> Value {
@@ -372,7 +372,7 @@ impl CommodityDataTool {
             match market {
                 "usd" => {
                     let symbols_to_try = vec![
-                        format!("MCX.{}!", clean_query),
+                        format!("MCX-{}1!", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -392,7 +392,7 @@ impl CommodityDataTool {
                 },
                 "inr" => {
                     let symbols_to_try = vec![
-                        format!("MCX.{}!", clean_query),
+                        format!("MCX-{}1!", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -413,7 +413,7 @@ impl CommodityDataTool {
 
                 _ => {
                     let symbols_to_try = vec![
-                        format!("MCX.{}!", clean_query),
+                        format!("MCX-{}1!", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -437,10 +437,10 @@ impl CommodityDataTool {
 
         // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
         if proxy_urls.len() < max_sources {
-            let url = format!("https://in.tradingview.com/symbols/{}", urlencoding::encode(query));
+            let url = format!("https://in.tradingview.com/symbols/{}1!", urlencoding::encode(query));
             let description = "Yahoo Finance Search".to_string();
 
-            let proxy_url = format!("https://in.tradingview.com/symbols/{}", urlencoding::encode(query));
+            let proxy_url = format!("https://in.tradingview.com/symbols/{}1!", urlencoding::encode(query));
             let proxy_description = "Yahoo Finance Search".to_string();
             
             proxy_urls.push((proxy_url, proxy_description));
