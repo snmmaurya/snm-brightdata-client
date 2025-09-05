@@ -30,7 +30,7 @@ impl Tool for CommodityDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}.MCX/ (e.g., CRUDEOIL.MCX, CRUDEOILM.MCX)."
+        "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://in.tradingview.com/symbols/MCX-CRUDEOIL1!/ (e.g., MCX.NATURALGAS1, MCX.CRUDEOIL1)."
     }
 
     fn input_schema(&self) -> Value {

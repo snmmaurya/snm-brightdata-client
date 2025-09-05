@@ -5,7 +5,6 @@ use std::collections::HashMap;
 /// Returns a static map of known stock-related names to Yahoo Finance-compatible symbols.
 fn known_name_to_symbol_map() -> HashMap<&'static str, &'static str> {
     HashMap::from([
-        ("NATURALGAS", "NATURALGAS"),
     ])
 }
 

@@ -5,14 +5,6 @@ use std::collections::HashMap;
 /// Returns a static map of known stock-related names to Yahoo Finance-compatible symbols.
 fn known_name_to_symbol_map() -> HashMap<&'static str, &'static str> {
     HashMap::from([
-        ("DSP Top 100 Equity Fund - Growth", "INF740K01021"),
-        ("DSP Top 100 Equity Fund - Dividend", "INF740K01039"),
-
-        ("DSP Mid Cap Fund - Growth", "INF740K01047"),
-        ("DSP Small Cap Fund - Growth", "INF740K01054"),
-
-        ("DSP Tax Saver Fund - Growth", "INF740K01062"),
-        ("DSP Equity & Bond Fund - Growth", "INF740K01070"),
     ])
 }
 

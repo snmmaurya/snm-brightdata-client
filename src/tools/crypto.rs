@@ -30,7 +30,7 @@ impl Tool for CryptoDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get comprehensive cryptocurrency data including prices, market cap, volumes with intelligent filtering and priority-based processing. Supports both direct BrightData API and proxy fallback."
+        "Get comprehensive cryptocurrency data including prices, market cap, volumes with intelligent filtering and priority-based processing. Supports both direct BrightData API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}-USD/ (e.g., BTC-USD, ETH-USD, SQL-USD)."
     }
 
     fn input_schema(&self) -> Value {

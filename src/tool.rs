@@ -555,7 +555,7 @@ impl ToolResolver {
             // Crypto tools
             serde_json::json!({
                 "name": "get_crypto_data",
-                "description": "Get cryptocurrency data including prices, market cap, trading volumes. Use for individual cryptos, crypto comparisons (BTC vs ETH), or overall crypto market analysis",
+                "description": "Get cryptocurrency data including prices, market cap, trading volumes. Use for individual cryptos, crypto comparisons (BTC vs ETH), or overall crypto market analysis. Source: Yahoo Finance https://finance.yahoo.com/quote/{}-USD/ (e.g., BTC-USD, ETH-USD, SQL-USD).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -615,7 +615,7 @@ impl ToolResolver {
             // Commodity tools
             serde_json::json!({
                 "name": "get_commodity_data",
-                "description": "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://finance.yahoo.com/quote/{}.MCX/ (e.g., CRUDEOIL.MCX, CRUDEOILM.MCX).",
+                "description": "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Tradingview https://in.tradingview.com/symbols/MCX-CRUDEOIL1!/ (e.g., MCX.NATURALGAS1, MCX.CRUDEOIL1).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

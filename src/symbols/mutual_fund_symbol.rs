@@ -4,8 +4,6 @@ use std::collections::HashMap;
 
 fn known_name_to_symbol_map() -> HashMap<&'static str, &'static str> {
     HashMap::from([
-        ("Axis Bluechip Fund - Growth", "INF846K01122"),
-        ("AXIS BANK mutual funds", "INF846K01122"),
     ])
 }
 
