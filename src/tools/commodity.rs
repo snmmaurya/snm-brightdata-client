@@ -372,7 +372,7 @@ impl CommodityDataTool {
             match market {
                 "usd" => {
                     let symbols_to_try = vec![
-                        format!("MCX-{}1!", clean_query),
+                        format!("MCX-{}1!/technicals", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -392,7 +392,7 @@ impl CommodityDataTool {
                 },
                 "inr" => {
                     let symbols_to_try = vec![
-                        format!("MCX-{}1!", clean_query),
+                        format!("MCX-{}1!/technicals", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -413,7 +413,7 @@ impl CommodityDataTool {
 
                 _ => {
                     let symbols_to_try = vec![
-                        format!("MCX-{}1!", clean_query),
+                        format!("MCX-{}1!/technicals", clean_query),
                         clean_query.clone(),
                     ];
                     
@@ -437,10 +437,10 @@ impl CommodityDataTool {
 
         // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
         if proxy_urls.len() < max_sources {
-            let url = format!("https://in.tradingview.com/symbols/{}1!", urlencoding::encode(query));
+            let url = format!("https://in.tradingview.com/symbols/{}1!/technicals", urlencoding::encode(query));
             let description = "Yahoo Finance Search".to_string();
 
-            let proxy_url = format!("https://in.tradingview.com/symbols/{}1!", urlencoding::encode(query));
+            let proxy_url = format!("https://in.tradingview.com/symbols/{}1!/technicals", urlencoding::encode(query));
             let proxy_description = "Yahoo Finance Search".to_string();
             
             proxy_urls.push((proxy_url, proxy_description));
@@ -966,7 +966,7 @@ impl CommodityDataTool {
 
     /// Test both direct API and proxy connectivity
     pub async fn test_connectivity(&self) -> Result<String, BrightDataError> {
-        let test_url = "https://in.tradingview.com/symbols/MCX-CRUDEOIL1!/";
+        let test_url = "https://in.tradingview.com/symbols/MCX-CRUDEOIL1!/technicals/";
         let mut results = Vec::new();
         
         // Test Direct API
