@@ -30,7 +30,7 @@ impl Tool for CommodityDataTool {
     }
 
     fn description(&self) -> &str {
-        "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://in.tradingview.com/symbols/MCX-CRUDEOIL1!/ (e.g., MCX.NATURALGAS1, MCX.CRUDEOIL1)."
+        "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Yahoo Finance https://in.tradingview.com/symbols/MCX-{}!/ (e.g., MCX.NATURALGAS1, MCX.CRUDEOIL1)."
     }
 
     fn input_schema(&self) -> Value {
@@ -372,17 +372,17 @@ impl CommodityDataTool {
             match market {
                 "usd" => {
                     let symbols_to_try = vec![
-                        format!("{}.MCX", clean_query),
+                        format!("MCX.{}!", clean_query),
                         clean_query.clone(),
                     ];
                     
                     for (i, symbol) in symbols_to_try.iter().enumerate() {
                         if i >= max_sources { break; }
                         
-                        let url = format!("https://finance.yahoo.com/quote/{}", symbol);
+                        let url = format!("https://in.tradingview.com/symbols/{}", symbol);
                         let description = format!("Yahoo Finance ({})", symbol);
 
-                        let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
+                        let proxy_url = format!("https://in.tradingview.com/symbols/{}/", symbol);
                         let proxy_description = format!("Yahoo Finance ({})", symbol);
                         
                         // Add to both proxy and direct (same URLs, different methods)
@@ -392,17 +392,17 @@ impl CommodityDataTool {
                 },
                 "inr" => {
                     let symbols_to_try = vec![
-                        format!("{}", clean_query),
+                        format!("MCX.{}!", clean_query),
                         clean_query.clone(),
                     ];
                     
                     for (i, symbol) in symbols_to_try.iter().enumerate() {
                         if i >= max_sources { break; }
                         
-                        let url = format!("https://finance.yahoo.com/quote/{}", symbol);
+                        let url = format!("https://in.tradingview.com/symbols/{}", symbol);
                         let description = format!("Yahoo Finance ({})", symbol);
 
-                        let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
+                        let proxy_url = format!("https://in.tradingview.com/symbols/{}/", symbol);
                         let proxy_description = format!("Yahoo Finance ({})", symbol);
                         
                         // Add to both proxy and direct (same URLs, different methods)
@@ -413,17 +413,17 @@ impl CommodityDataTool {
 
                 _ => {
                     let symbols_to_try = vec![
-                        format!("{}", clean_query),
+                        format!("MCX.{}!", clean_query),
                         clean_query.clone(),
                     ];
                     
                     for (i, symbol) in symbols_to_try.iter().enumerate() {
                         if i >= max_sources { break; }
                         
-                        let url = format!("https://finance.yahoo.com/quote/{}", symbol);
+                        let url = format!("https://in.tradingview.com/symbols/{}", symbol);
                         let description = format!("Yahoo Finance ({})", symbol);
 
-                        let proxy_url = format!("https://finance.yahoo.com/quote/{}/", symbol);
+                        let proxy_url = format!("https://in.tradingview.com/symbols/{}/", symbol);
                         let proxy_description = format!("Yahoo Finance ({})", symbol);
                         
                         // Add to both proxy and direct (same URLs, different methods)
@@ -437,10 +437,10 @@ impl CommodityDataTool {
 
         // Add search fallbacks (no restrictions when DEDUCT_DATA=false)
         if proxy_urls.len() < max_sources {
-            let url = format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query));
+            let url = format!("https://in.tradingview.com/symbols/{}", urlencoding::encode(query));
             let description = "Yahoo Finance Search".to_string();
 
-            let proxy_url = format!("https://finance.yahoo.com/quote/{}", urlencoding::encode(query));
+            let proxy_url = format!("https://in.tradingview.com/symbols/{}", urlencoding::encode(query));
             let proxy_description = "Yahoo Finance Search".to_string();
             
             proxy_urls.push((proxy_url, proxy_description));
@@ -963,16 +963,10 @@ impl CommodityDataTool {
         valid_chars && has_letters
     }
 
-    // ----------------- Pair helpers -----------------
-    fn normalize_pair(raw: &str) -> String {
-        // Accept "usd/inr", "usd-inr", "USDINR", "USDINR=X" -> return "USDINR" (without =X here)
-        let s = raw.trim().to_uppercase().replace(['/', '-', ' '], "");
-        s.trim().to_string()
-    }
 
     /// Test both direct API and proxy connectivity
     pub async fn test_connectivity(&self) -> Result<String, BrightDataError> {
-        let test_url = "https://finance.yahoo.com/quote/USDINR=X/";
+        let test_url = "https://in.tradingview.com/symbols/MCX-CRUDEOIL1!/";
         let mut results = Vec::new();
         
         // Test Direct API

@@ -615,7 +615,7 @@ impl ToolResolver {
             // Commodity tools
             serde_json::json!({
                 "name": "get_commodity_data",
-                "description": "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Tradingview https://in.tradingview.com/symbols/MCX-CRUDEOIL1!/ (e.g., MCX.NATURALGAS1, MCX.CRUDEOIL1).",
+                "description": "Get commodity (futures) snapshot (price, change, ranges) with cache, BrightData direct API and proxy fallback. Source: Tradingview https://in.tradingview.com/symbols/MCX-{}!/ (e.g., MCX.NATURALGAS1, MCX.CRUDEOIL1).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
